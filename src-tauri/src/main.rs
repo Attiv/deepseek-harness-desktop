@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
@@ -159,7 +162,6 @@ fn spawn_dsh() -> Option<Child> {
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000);
     }
 
@@ -595,10 +597,23 @@ fn main() {
                     return;
                 }
                 "quit" => {
-                    // 退出前 kill 掉 npx/dsh 子进程
+                    // 退出前 kill 掉 npx/dsh 整个进程树
                     if let Some(state) = app.try_state::<DshChild>() {
-                        if let Some(mut child) = state.0.lock().unwrap().take() {
-                            let _ = child.kill();
+                        if let Some(child) = state.0.lock().unwrap().take() {
+                            let pid = child.id();
+                            // Windows: taskkill /T /F 递归 kill 进程树
+                            // macOS/Linux: kill 整个进程组
+                            #[cfg(target_os = "windows")]
+                            {
+                                let _ = Command::new("taskkill")
+                                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                                    .creation_flags(0x08000000)
+                                    .output();
+                            }
+                            #[cfg(not(target_os = "windows"))]
+                            {
+                                let _ = child.kill();
+                            }
                         }
                     }
                     app.exit(0);
