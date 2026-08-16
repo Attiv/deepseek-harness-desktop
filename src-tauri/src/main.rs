@@ -147,10 +147,12 @@ fn main() {
     } else {
         spawn_dsh()
     };
+    // 在 move 之前记录是否启动了子进程
+    let had_child = child.is_some();
 
     tauri::Builder::default()
         .manage(DshChild(Mutex::new(child.take())))
-        .setup(|app| {
+        .setup(move |app| {
             let main_window = WebviewWindowBuilder::new(
                 app,
                 "main",
@@ -164,7 +166,6 @@ fn main() {
             .build()?;
 
             let window = main_window.clone();
-            let had_child = child.is_some();
             // 后台线程:轮询 dsh 就绪后导航并显示窗口
             tauri::async_runtime::spawn(async move {
                 let deadline =
