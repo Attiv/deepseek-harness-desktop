@@ -13,12 +13,71 @@ use std::time::{Duration, Instant};
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 const DSH_PORT: u16 = 3080;
 const DSH_URL: &str = "http://127.0.0.1:3080";
 const BOOT_TIMEOUT_SECS: u64 = 180;
 
 struct DshChild(Mutex<Option<Child>>);
+
+/// 读取快捷键配置(~/.dsh/settings.yaml 里的 app-shortcut 字段)
+/// 返回 Tauri 快捷键字符串,如 "Ctrl+Shift+D" 或 "Cmd+Shift+D"
+fn read_shortcut() -> String {
+    let default = if cfg!(target_os = "macos") {
+        "Cmd+Shift+D".to_string()
+    } else {
+        "Ctrl+Shift+D".to_string()
+    };
+
+    let settings = dsh_home().join("settings.yaml");
+    let content = match fs::read_to_string(&settings) {
+        Ok(c) => c,
+        Err(_) => return default,
+    };
+
+    // 简单解析 yaml 里的 app-shortcut 行
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("app-shortcut:") {
+            let val = trimmed["app-shortcut:".len()..].trim();
+            let val = val.trim_matches('"').trim_matches('\'');
+            if !val.is_empty() {
+                return val.to_string();
+            }
+        }
+    }
+    default
+}
+
+/// 写入快捷键配置到 ~/.dsh/settings.yaml
+fn write_shortcut(shortcut: &str) -> Result<(), String> {
+    let settings = dsh_home().join("settings.yaml");
+    let content = fs::read_to_string(&settings).map_err(|e| e.to_string())?;
+
+    // 检查是否已有 app-shortcut 行
+    let mut found = false;
+    let mut new_lines: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("app-shortcut:") {
+            // 替换已有的快捷键
+            let indent = line.len() - trimmed.len();
+            new_lines.push(format!("{}app-shortcut: \"{}\"", " ".repeat(indent), shortcut));
+            found = true;
+        } else {
+            new_lines.push(line.to_string());
+        }
+    }
+
+    // 没找到就追加到末尾
+    if !found {
+        new_lines.push(format!("app-shortcut: \"{}\"", shortcut));
+    }
+
+    fs::write(&settings, new_lines.join("\n") + "\n").map_err(|e| e.to_string())
+}
 
 /// 获取 DSH 配置目录 (~/.dsh)
 fn dsh_home() -> PathBuf {
@@ -165,6 +224,20 @@ fn add_to_zip<W: Write + std::io::Seek>(
     Ok(())
 }
 
+/// Tauri 命令:设置快捷键(从前端 invoke 调用)
+#[tauri::command]
+fn set_shortcut_cmd(app: tauri::AppHandle, shortcut: String) -> Result<String, String> {
+    let s = shortcut.trim();
+    if s.is_empty() {
+        return Err("快捷键不能为空".to_string());
+    }
+    // 验证格式
+    s.parse::<Shortcut>().map_err(|e| format!("快捷键格式错误: {}", e))?;
+    // 写入配置
+    write_shortcut(s)?;
+    Ok(format!("快捷键已设为: {}\n请重启应用生效。", s))
+}
+
 /// 导出配置
 fn do_export(app: &tauri::AppHandle, include_credentials: bool) -> Result<String, String> {
     let dsh = dsh_home();
@@ -306,6 +379,14 @@ code{{background:#16213e;padding:2px 6px;border-radius:3px;font-size:13px}}
 }
 
 fn main() {
+    // 单实例锁:如果已有实例在跑,显示已有窗口然后退出
+    let _single = tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    });
+
     let mut child = if dsh_running() {
         None
     } else {
@@ -313,22 +394,70 @@ fn main() {
     };
     let had_child = child.is_some();
 
+    // 读取用户配置的快捷键
+    let shortcut_str = read_shortcut();
+    let shortcut: Shortcut = shortcut_str
+        .parse()
+        .unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") {
+                "Cmd+Shift+D".parse().unwrap()
+            } else {
+                "Ctrl+Shift+D".parse().unwrap()
+            }
+        });
+
     tauri::Builder::default()
+        .plugin(_single)
         .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![set_shortcut_cmd])
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(move |app, sc, event| {
+                    if event.state != ShortcutState::Pressed {
+                        return;
+                    }
+                    if *sc == shortcut {
+                        if let Some(window) = app.get_webview_window("main") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    }
+                })
+                .build(),
+        )
         .setup(move |app| {
-            // 构建原生菜单:配置 > [导出(不含Keys), 导出(含Keys), 导入]
+            // 注册全局快捷键
+            app.global_shortcut().register(shortcut)
+                .map_err(|e| format!("注册快捷键失败: {}", e))?;
+
+            // 构建原生菜单
             let export_no_cred = MenuItemBuilder::with_id("export-no-cred", "导出配置(不含 API Keys)")
                 .build(app)?;
             let export_with_cred = MenuItemBuilder::with_id("export-cred", "导出配置(含 API Keys)")
                 .build(app)?;
             let import_item = MenuItemBuilder::with_id("import", "导入配置…")
                 .build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "退出 DeepSeek Harness")
+                .build(app)?;
+            let toggle_item = MenuItemBuilder::with_id("toggle", format!("显示/隐藏窗口 ({})", shortcut_str))
+                .build(app)?;
+            let set_shortcut_item = MenuItemBuilder::with_id("set-shortcut", "设置快捷键…")
+                .build(app)?;
 
             let config_submenu = SubmenuBuilder::new(app, "配置")
+                .item(&toggle_item)
+                .item(&set_shortcut_item)
+                .separator()
                 .item(&export_no_cred)
                 .item(&export_with_cred)
                 .separator()
                 .item(&import_item)
+                .separator()
+                .item(&quit_item)
                 .build()?;
 
             let menu = MenuBuilder::new(app).item(&config_submenu).build()?;
@@ -387,6 +516,47 @@ fn main() {
             Ok(())
         })
         .on_menu_event(move |app, event| {
+            match event.id().as_ref() {
+                "toggle" => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        if window.is_visible().unwrap_or(false) {
+                            let _ = window.hide();
+                        } else {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    return;
+                }
+                "set-shortcut" => {
+                    let current = read_shortcut();
+                    let prompt_msg = format!(
+                        "当前快捷键: {}\n\n请输入新快捷键组合:\n(留空取消)\n\n格式: Ctrl+Alt+D, Alt+Space, Cmd+Shift+H",
+                        current
+                    );
+                    if let Some(window) = app.get_webview_window("main") {
+                        let js = format!(
+                            r#"(function(){{
+                                var v = prompt({});
+                                if(v && v.trim()){{
+                                    window.__TAURI_INTERNALS__.invoke('set_shortcut_cmd', {{shortcut: v.trim()}})
+                                        .then(function(msg){{ alert(msg); }})
+                                        .catch(function(e){{ alert('错误: ' + e); }});
+                                }}
+                            }})()"#,
+                            serde_json::to_string(&prompt_msg).unwrap()
+                        );
+                        let _ = window.eval(&js);
+                    }
+                    return;
+                }
+                "quit" => {
+                    app.exit(0);
+                    return;
+                }
+                _ => {}
+            }
+
             let msg = match event.id().as_ref() {
                 "export-no-cred" => do_export(app, false),
                 "export-cred" => do_export(app, true),
@@ -414,9 +584,12 @@ fn main() {
         })
         .manage(DshChild(Mutex::new(child.take())))
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
-                    std::process::exit(0);
+                    // 隐藏窗口而不是退出,这样快捷键能重新唤回
+                    // 真正退出通过菜单「退出」或系统托盘
+                    let _ = window.hide();
+                    api.prevent_close();
                 }
             }
         })
