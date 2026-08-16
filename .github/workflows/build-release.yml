@@ -76,6 +76,6 @@ jobs:
             ### 说明
             - 后端走 `npx @deepseek-ai/dsh web`,官方更新自动跟随
             - 需要 Node.js 环境
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
