@@ -21,6 +21,9 @@ const BOOT_TIMEOUT_SECS: u64 = 180;
 
 struct DshChild(Mutex<Option<Child>>);
 
+/// 当前生效的快捷键(handler 动态读取,可在运行时更改)
+struct CurrentShortcut(Mutex<Shortcut>);
+
 /// 读取快捷键配置(~/.dsh/settings.yaml 里的 app-shortcut 字段)
 /// 返回 Tauri 快捷键字符串,如 "Ctrl+Shift+D" 或 "Cmd+Shift+D"
 fn read_shortcut() -> String {
@@ -231,11 +234,27 @@ fn set_shortcut_cmd(app: tauri::AppHandle, shortcut: String) -> Result<String, S
     if s.is_empty() {
         return Err("快捷键不能为空".to_string());
     }
-    // 验证格式
-    s.parse::<Shortcut>().map_err(|e| format!("快捷键格式错误: {}", e))?;
-    // 写入配置
+    let new_sc: Shortcut = s.parse().map_err(|e| format!("快捷键格式错误: {}", e))?;
+
+    // 注销旧快捷键
+    let old_str = read_shortcut();
+    if let Ok(old_sc) = old_str.parse::<Shortcut>() {
+        let _ = app.global_shortcut().unregister(old_sc);
+    }
+
+    // 注册新快捷键
+    app.global_shortcut().register(new_sc)
+        .map_err(|e| format!("注册快捷键失败: {}", e))?;
+
+    // 写入配置文件
     write_shortcut(s)?;
-    Ok(format!("快捷键已设为: {}\n请重启应用生效。", s))
+
+    // 更新内存中的当前快捷键(handler 会动态读取)
+    if let Some(state) = app.try_state::<CurrentShortcut>() {
+        *state.0.lock().unwrap() = new_sc;
+    }
+
+    Ok(format!("快捷键已设为: {} (立即生效)", s))
 }
 
 /// 导出配置
@@ -410,13 +429,20 @@ fn main() {
         .plugin(_single)
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![set_shortcut_cmd])
+        .manage(CurrentShortcut(Mutex::new(shortcut)))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, sc, event| {
                     if event.state != ShortcutState::Pressed {
                         return;
                     }
-                    if *sc == shortcut {
+                    // 从 state 动态读取当前快捷键(支持运行时更改)
+                    let current = if let Some(state) = app.try_state::<CurrentShortcut>() {
+                        *state.0.lock().unwrap()
+                    } else {
+                        return;
+                    };
+                    if *sc == current {
                         if let Some(window) = app.get_webview_window("main") {
                             if window.is_visible().unwrap_or(false) {
                                 let _ = window.hide();
@@ -531,7 +557,7 @@ fn main() {
                 "set-shortcut" => {
                     let current = read_shortcut();
                     let prompt_msg = format!(
-                        "当前快捷键: {}\n\n请输入新快捷键组合:\n(留空取消)\n\n格式: Ctrl+Alt+D, Alt+Space, Cmd+Shift+H",
+                        "当前快捷键: {}\n\n请输入新快捷键组合:\n(留空取消,设置后立即生效)\n\n格式: Ctrl+Q, Alt+Space, Cmd+Shift+H",
                         current
                     );
                     if let Some(window) = app.get_webview_window("main") {
