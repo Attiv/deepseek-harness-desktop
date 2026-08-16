@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>设置快捷键</title>
+<style>
+  html,body{margin:0;height:100%;background:#1a1a2e;color:#e0e0e0;
+    font-family:-apple-system,"Segoe UI",system-ui,sans-serif;display:flex;
+    align-items:center;justify-content:center;flex-direction:column;gap:16px}
+  input{width:280px;padding:10px 14px;font-size:16px;border:1px solid #303a52;
+    border-radius:6px;background:#16213e;color:#e0e0e0;outline:none}
+  input:focus{border-color:#58a6ff}
+  button{padding:10px 24px;font-size:15px;border:none;border-radius:6px;
+    cursor:pointer;margin:0 6px}
+  .ok{background:#238636;color:#fff}
+  .ok:hover{background:#2ea043}
+  .cancel{background:#21262d;color:#c9d1d9}
+  .cancel:hover{background:#30363d}
+  .hint{font-size:12px;color:#8b949e;max-width:340px;text-align:center;line-height:1.5}
+  code{background:#21262d;padding:2px 6px;border-radius:3px;font-size:12px;color:#7ee787}
+  .err{color:#f85149;font-size:13px;min-height:18px}
+</style>
+</head>
+<body>
+  <h3 style="margin:0;font-size:17px">设置全局快捷键</h3>
+  <input id="sc" placeholder="Ctrl+Q" autofocus />
+  <div class="err" id="err"></div>
+  <div class="hint">
+    格式:<code>Ctrl+Shift+D</code> <code>Alt+Space</code> <code>Cmd+Shift+H</code><br>
+    修饰键 + 主键,用 + 连接
+  </div>
+  <div style="display:flex">
+    <button class="cancel" onclick="cancel()">取消</button>
+    <button class="ok" onclick="save()">确定</button>
+  </div>
+<script>
+  const { invoke } = window.__TAURI_INTERNALS__;
+  const err = document.getElementById('err');
+  const input = document.getElementById('sc');
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') save();
+    if (e.key === 'Escape') cancel();
+  });
+
+  function cancel() {
+    invoke('close_shortcut_window');
+  }
+
+  async function save() {
+    err.textContent = '';
+    const v = input.value.trim();
+    if (!v) { err.textContent = '请输入快捷键'; return; }
+    try {
+      const msg = await invoke('set_shortcut_cmd', { shortcut: v });
+      alert(msg);
+      invoke('close_shortcut_window');
+    } catch(e) {
+      err.textContent = String(e);
+    }
+  }
+</script>
+</body>
+</html>

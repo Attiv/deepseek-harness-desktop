@@ -254,7 +254,54 @@ fn set_shortcut_cmd(app: tauri::AppHandle, shortcut: String) -> Result<String, S
         *state.0.lock().unwrap() = new_sc;
     }
 
+    // 重建菜单(让 toggle 项显示新快捷键)
+    if let Err(e) = rebuild_menu(&app) {
+        eprintln!("重建菜单失败: {}", e);
+    }
+
     Ok(format!("快捷键已设为: {} (立即生效)", s))
+}
+
+/// 重建应用菜单(用于快捷键变更后更新菜单标题)
+fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
+    let current_shortcut = read_shortcut();
+
+    let toggle_item = MenuItemBuilder::with_id("toggle", format!("显示/隐藏窗口 ({})", current_shortcut))
+        .build(app).map_err(|e| e.to_string())?;
+    let set_shortcut_item = MenuItemBuilder::with_id("set-shortcut", "设置快捷键…")
+        .build(app).map_err(|e| e.to_string())?;
+    let export_no_cred = MenuItemBuilder::with_id("export-no-cred", "导出配置(不含 API Keys)")
+        .build(app).map_err(|e| e.to_string())?;
+    let export_with_cred = MenuItemBuilder::with_id("export-cred", "导出配置(含 API Keys)")
+        .build(app).map_err(|e| e.to_string())?;
+    let import_item = MenuItemBuilder::with_id("import", "导入配置…")
+        .build(app).map_err(|e| e.to_string())?;
+    let quit_item = MenuItemBuilder::with_id("quit", "退出 DeepSeek Harness")
+        .build(app).map_err(|e| e.to_string())?;
+
+    let config_submenu = SubmenuBuilder::new(app, "配置")
+        .item(&toggle_item)
+        .item(&set_shortcut_item)
+        .separator()
+        .item(&export_no_cred)
+        .item(&export_with_cred)
+        .separator()
+        .item(&import_item)
+        .separator()
+        .item(&quit_item)
+        .build().map_err(|e| e.to_string())?;
+
+    let menu = MenuBuilder::new(app).item(&config_submenu).build().map_err(|e| e.to_string())?;
+    app.set_menu(menu).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 关闭快捷键设置窗口
+#[tauri::command]
+fn close_shortcut_window(app: tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("shortcut-input") {
+        let _ = w.close();
+    }
 }
 
 /// 导出配置
@@ -428,7 +475,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(_single)
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![set_shortcut_cmd])
+        .invoke_handler(tauri::generate_handler![set_shortcut_cmd, close_shortcut_window])
         .manage(CurrentShortcut(Mutex::new(shortcut)))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -461,33 +508,7 @@ fn main() {
                 .map_err(|e| format!("注册快捷键失败: {}", e))?;
 
             // 构建原生菜单
-            let export_no_cred = MenuItemBuilder::with_id("export-no-cred", "导出配置(不含 API Keys)")
-                .build(app)?;
-            let export_with_cred = MenuItemBuilder::with_id("export-cred", "导出配置(含 API Keys)")
-                .build(app)?;
-            let import_item = MenuItemBuilder::with_id("import", "导入配置…")
-                .build(app)?;
-            let quit_item = MenuItemBuilder::with_id("quit", "退出 DeepSeek Harness")
-                .build(app)?;
-            let toggle_item = MenuItemBuilder::with_id("toggle", format!("显示/隐藏窗口 ({})", shortcut_str))
-                .build(app)?;
-            let set_shortcut_item = MenuItemBuilder::with_id("set-shortcut", "设置快捷键…")
-                .build(app)?;
-
-            let config_submenu = SubmenuBuilder::new(app, "配置")
-                .item(&toggle_item)
-                .item(&set_shortcut_item)
-                .separator()
-                .item(&export_no_cred)
-                .item(&export_with_cred)
-                .separator()
-                .item(&import_item)
-                .separator()
-                .item(&quit_item)
-                .build()?;
-
-            let menu = MenuBuilder::new(app).item(&config_submenu).build()?;
-            app.set_menu(menu)?;
+            rebuild_menu(&app.handle())?;
 
             // 创建主窗口
             let main_window = WebviewWindowBuilder::new(
@@ -555,28 +576,31 @@ fn main() {
                     return;
                 }
                 "set-shortcut" => {
-                    let current = read_shortcut();
-                    let prompt_msg = format!(
-                        "当前快捷键: {}\n\n请输入新快捷键组合:\n(留空取消,设置后立即生效)\n\n格式: Ctrl+Q, Alt+Space, Cmd+Shift+H",
-                        current
-                    );
-                    if let Some(window) = app.get_webview_window("main") {
-                        let js = format!(
-                            r#"(function(){{
-                                var v = prompt({});
-                                if(v && v.trim()){{
-                                    window.__TAURI_INTERNALS__.invoke('set_shortcut_cmd', {{shortcut: v.trim()}})
-                                        .then(function(msg){{ alert(msg); }})
-                                        .catch(function(e){{ alert('错误: ' + e); }});
-                                }}
-                            }})()"#,
-                            serde_json::to_string(&prompt_msg).unwrap()
-                        );
-                        let _ = window.eval(&js);
+                    // 创建独立的输入窗口(不依赖 dsh 前端的 __TAURI_INTERNALS__)
+                    if let Some(_existing) = app.get_webview_window("shortcut-input") {
+                        let _ = _existing.set_focus();
+                        return;
                     }
+                    let _ = WebviewWindowBuilder::new(
+                        app,
+                        "shortcut-input",
+                        WebviewUrl::App("shortcut-input.html".into()),
+                    )
+                    .title("设置快捷键")
+                    .inner_size(420.0, 280.0)
+                    .resizable(false)
+                    .center()
+                    .always_on_top(true)
+                    .build();
                     return;
                 }
                 "quit" => {
+                    // 退出前 kill 掉 npx/dsh 子进程
+                    if let Some(state) = app.try_state::<DshChild>() {
+                        if let Some(mut child) = state.0.lock().unwrap().take() {
+                            let _ = child.kill();
+                        }
+                    }
                     app.exit(0);
                     return;
                 }
