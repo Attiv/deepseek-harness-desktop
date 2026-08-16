@@ -1,0 +1,36 @@
+# --- Rust / Tauri 构建产物 ---
+/src-tauri/target/
+/src-tauri/gen/schemas/
+
+# --- Node 依赖 ---
+node_modules/
+
+# --- 编译输出 / 打包产物 ---
+/release/
+*.exe
+*.msi
+*.dmg
+*.deb
+*.AppImage
+
+# --- 日志 ---
+*.log
+build.log
+build2.log
+
+# --- 系统 / 编辑器 ---
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+*.code-workspace
+
+# --- 环境变量 / 敏感信息 ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.yaml
+.credentials.yaml
