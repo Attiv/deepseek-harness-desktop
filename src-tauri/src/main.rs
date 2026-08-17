@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -294,7 +294,27 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .build().map_err(|e| e.to_string())?;
 
     let menu = MenuBuilder::new(app).item(&config_submenu).build().map_err(|e| e.to_string())?;
-    app.set_menu(menu).map_err(|e| e.to_string())?;
+
+    // macOS: 添加编辑菜单(让 Cmd+C/V/X/A/Z 生效)
+    #[cfg(target_os = "macos")]
+    {
+        let copy_item = PredefinedMenuItem::copy(app, Some("复制")).map_err(|e| e.to_string())?;
+        let cut_item = PredefinedMenuItem::cut(app, Some("剪切")).map_err(|e| e.to_string())?;
+        let paste_item = PredefinedMenuItem::paste(app, Some("粘贴")).map_err(|e| e.to_string())?;
+        let select_all_item = PredefinedMenuItem::select_all(app, Some("全选")).map_err(|e| e.to_string())?;
+        let edit_menu = SubmenuBuilder::new(app, "编辑")
+            .item(&copy_item)
+            .item(&cut_item)
+            .item(&paste_item)
+            .item(&select_all_item)
+            .build().map_err(|e| e.to_string())?;
+        let full_menu = MenuBuilder::new(app).item(&config_submenu).item(&edit_menu).build().map_err(|e| e.to_string())?;
+        app.set_menu(full_menu).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        app.set_menu(menu).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -344,8 +364,26 @@ fn build_export_zip(dsh: &Path, save_path: &Path, include_credentials: bool) -> 
     let file = File::create(save_path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
 
+    // 写入 manifest 标记是否含 credentials
+
     for item in EXPORT_ITEMS {
         let rel = PathBuf::from(item);
+        // 对 credentials 单独处理,确保路径比较正确
+        if item == &".credentials.yaml" {
+            if include_credentials {
+                let full = dsh.join(&rel);
+                if full.exists() {
+                    let options = zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated);
+                    zip.start_file(".credentials.yaml", options).map_err(|e| e.to_string())?;
+                    let mut f = File::open(&full).map_err(|e| e.to_string())?;
+                    let mut buf = Vec::new();
+                    f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+                    zip.write_all(&buf).map_err(|e| e.to_string())?;
+                }
+            }
+            continue;
+        }
         add_to_zip(&mut zip, dsh, &rel, include_credentials)?;
     }
 
