@@ -306,30 +306,47 @@ fn close_shortcut_window(app: tauri::AppHandle) {
     }
 }
 
-/// 导出配置
-fn do_export(app: &tauri::AppHandle, include_credentials: bool) -> Result<String, String> {
+/// 导出配置(异步,避免 macOS blocking dialog 死锁)
+fn do_export(app: &tauri::AppHandle, include_credentials: bool) {
     let dsh = dsh_home();
-    let window = app.get_webview_window("main").ok_or("找不到主窗口")?;
+    let window = match app.get_webview_window("main") {
+        Some(w) => w,
+        None => return,
+    };
+    let win = window.clone();
 
-    let save_path = window
+    window
         .dialog()
         .file()
         .set_title("导出 DSH 配置")
         .add_filter("ZIP 文件", &["zip"])
         .set_file_name("dsh-config.zip")
-        .blocking_save_file();
+        .save_file(move |file_path| {
+            let save_path = match file_path {
+                Some(p) => match p.into_path() {
+                    Ok(path) => path,
+                    Err(_) => return,
+                },
+                None => return,
+            };
 
-    let save_path = match save_path {
-        Some(p) => p.into_path().map_err(|e| e.to_string())?,
-        None => return Ok("cancelled".to_string()),
-    };
+            let result = build_export_zip(&dsh, &save_path, include_credentials);
+            let msg = match result {
+                Ok(s) => s,
+                Err(e) => format!("错误: {}", e),
+            };
+            let _ = win.eval(&format!("alert({});", serde_json::to_string(&msg).unwrap()));
+        });
+}
 
-    let file = File::create(&save_path).map_err(|e| e.to_string())?;
+/// 实际构建导出 zip(同步,在回调线程执行)
+fn build_export_zip(dsh: &Path, save_path: &Path, include_credentials: bool) -> Result<String, String> {
+    let file = File::create(save_path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
 
     for item in EXPORT_ITEMS {
         let rel = PathBuf::from(item);
-        add_to_zip(&mut zip, &dsh, &rel, include_credentials)?;
+        add_to_zip(&mut zip, dsh, &rel, include_credentials)?;
     }
 
     let profiles_dir = dsh.join("profiles");
@@ -343,7 +360,7 @@ fn do_export(app: &tauri::AppHandle, include_credentials: bool) -> Result<String
                 let pf_path = profile_dir.join(pf);
                 if pf_path.exists() {
                     let rel = PathBuf::from("profiles").join(&profile_name).join(pf);
-                    add_to_zip(&mut zip, &dsh, &rel, true)?;
+                    add_to_zip(&mut zip, dsh, &rel, true)?;
                 }
             }
         }
@@ -358,33 +375,49 @@ fn do_export(app: &tauri::AppHandle, include_credentials: bool) -> Result<String
     });
     zip.write_all(serde_json::to_string_pretty(&manifest).unwrap().as_bytes())
         .map_err(|e| e.to_string())?;
-
     zip.finish().map_err(|e| e.to_string())?;
 
     Ok(format!("配置已导出到:\n{}", save_path.display()))
 }
 
-/// 导入配置
-fn do_import(app: &tauri::AppHandle) -> Result<String, String> {
+/// 导入配置(异步,避免 macOS blocking dialog 死锁)
+fn do_import(app: &tauri::AppHandle) {
     let dsh = dsh_home();
-    let window = app.get_webview_window("main").ok_or("找不到主窗口")?;
+    let window = match app.get_webview_window("main") {
+        Some(w) => w,
+        None => return,
+    };
+    let win = window.clone();
 
-    let open_path = window
+    window
         .dialog()
         .file()
         .set_title("导入 DSH 配置")
         .add_filter("ZIP 文件", &["zip"])
-        .blocking_pick_file();
+        .pick_file(move |file_path| {
+            let open_path = match file_path {
+                Some(p) => match p.into_path() {
+                    Ok(path) => path,
+                    Err(_) => return,
+                },
+                None => return,
+            };
 
-    let open_path = match open_path {
-        Some(p) => p.into_path().map_err(|e| e.to_string())?,
-        None => return Ok("cancelled".to_string()),
-    };
+            let result = extract_import_zip(&dsh, &open_path);
+            let msg = match result {
+                Ok(s) => s,
+                Err(e) => format!("错误: {}", e),
+            };
+            let _ = win.eval(&format!("alert({});", serde_json::to_string(&msg).unwrap()));
+        });
+}
 
-    let file = File::open(&open_path).map_err(|e| e.to_string())?;
+/// 实际解压导入 zip(同步,在回调线程执行)
+fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
+    let file = File::open(open_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
 
-    fs::create_dir_all(&dsh).map_err(|e| e.to_string())?;
+    fs::create_dir_all(dsh).map_err(|e| e.to_string())?;
 
     let mut extracted = 0;
     for i in 0..archive.len() {
@@ -397,8 +430,7 @@ fn do_import(app: &tauri::AppHandle) -> Result<String, String> {
 
         let out_path = dsh.join(&name);
 
-        // 防 zip slip
-        let canonical_dsh = dsh.canonicalize().unwrap_or_else(|_| dsh.clone());
+        let canonical_dsh = dsh.canonicalize().unwrap_or_else(|_| dsh.to_path_buf());
         if !out_path.starts_with(&canonical_dsh) {
             continue;
         }
@@ -622,29 +654,11 @@ fn main() {
                 _ => {}
             }
 
-            let msg = match event.id().as_ref() {
+            match event.id().as_ref() {
                 "export-no-cred" => do_export(app, false),
                 "export-cred" => do_export(app, true),
                 "import" => do_import(app),
-                _ => return,
-            };
-
-            if let Ok(result) = msg {
-                if result != "cancelled" {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.eval(&format!(
-                            "alert({});",
-                            serde_json::to_string(&result).unwrap()
-                        ));
-                    }
-                }
-            } else if let Err(e) = msg {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.eval(&format!(
-                        "alert('错误: ' + {});",
-                        serde_json::to_string(&e).unwrap()
-                    ));
-                }
+                _ => {}
             }
         })
         .manage(DshChild(Mutex::new(child.take())))
