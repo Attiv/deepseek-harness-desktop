@@ -1,9 +1,7 @@
 name: Build & Release
 
 on:
-  # 手动触发:在 Actions 页面点 "Run workflow"
   workflow_dispatch:
-  # 打 tag 触发:git tag v1.0.0 && git push --tags
   push:
     tags:
       - "v*"
@@ -12,18 +10,48 @@ permissions:
   contents: write
 
 jobs:
+  # Job 1: 创建 Release(只跑一次)
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release-url: ${{ steps.create.outputs.url }}
+    steps:
+      - name: Create Release
+        id: create
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "DeepSeek Harness Desktop ${{ github.ref_name }}"
+          body: |
+            ## DeepSeek Harness Desktop
+
+            自动构建的桌面应用,支持 Windows / macOS / Linux。
+
+            ### 安装
+            - **Windows**: 下载 `*-setup.exe`(NSIS 安装程序)或 `*.msi`
+            - **macOS**: 下载 `.dmg`(Intel 用 x64,Apple Silicon 用 aarch64)
+            - **Linux**: 下载 `.AppImage` 或 `.deb`
+
+            ### 说明
+            - 后端走 `npx @deepseek-ai/dsh web`,官方更新自动跟随
+            - 需要 Node.js 环境
+          draft: false
+          prerelease: false
+
+  # Job 2: 并行构建各平台,上传产物到 Release
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: "macos-latest" # macOS Intel
+          - platform: "macos-latest"
             args: "--target x86_64-apple-darwin"
-          - platform: "macos-latest" # macOS Apple Silicon
+          - platform: "macos-latest"
             args: "--target aarch64-apple-darwin"
-          - platform: "ubuntu-22.04" # Linux (可选)
+          - platform: "ubuntu-22.04"
             args: ""
-          - platform: "windows-latest" # Windows
+          - platform: "windows-latest"
             args: ""
 
     runs-on: ${{ matrix.platform }}
@@ -45,7 +73,6 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          # macOS 需要额外 target 才能交叉编译两种架构
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache
@@ -56,26 +83,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
-      - name: Build the app
+      - name: Build and upload
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "DeepSeek Harness Desktop ${{ github.ref_name }}"
-          releaseBody: |
-            ## DeepSeek Harness Desktop
-
-            自动构建的桌面应用,支持 Windows / macOS / Linux。
-
-            ### 安装
-            - **Windows**: 下载 `*-setup.exe`(NSIS 安装程序)或 `*.msi`
-            - **macOS**: 下载 `.dmg`(Intel 用 x86_64,Apple Silicon 用 aarch64)
-            - **Linux**: 下载 `.AppImage` 或 `.deb`
-
-            ### 说明
-            - 后端走 `npx @deepseek-ai/dsh web`,官方更新自动跟随
-            - 需要 Node.js 环境
-          releaseDraft: false
-          prerelease: false
+          # 不设 releaseName/releaseBody/releaseDraft,避免重复创建
+          # tauri-action 会找到上面 softprops 已创建的 Release 并上传产物
           args: ${{ matrix.args }}

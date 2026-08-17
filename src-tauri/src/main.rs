@@ -599,7 +599,7 @@ fn main() {
                 "quit" => {
                     // 退出前 kill 掉 npx/dsh 整个进程树
                     if let Some(state) = app.try_state::<DshChild>() {
-                        if let Some(child) = state.0.lock().unwrap().take() {
+                        if let Some(mut child) = state.0.lock().unwrap().take() {
                             let pid = child.id();
                             // Windows: taskkill /T /F 递归 kill 进程树
                             // macOS/Linux: kill 整个进程组
