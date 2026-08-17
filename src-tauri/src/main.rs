@@ -279,6 +279,7 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
     let import_item = MenuItemBuilder::with_id("import", "导入配置…")
         .build(app).map_err(|e| e.to_string())?;
     let quit_item = MenuItemBuilder::with_id("quit", "退出 DeepSeek Harness")
+        .accelerator("CmdOrCtrl+Q")
         .build(app).map_err(|e| e.to_string())?;
 
     let config_submenu = SubmenuBuilder::new(app, "配置")
@@ -481,6 +482,16 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
             }
             let mut out_file = File::create(&out_path).map_err(|e| e.to_string())?;
             std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+            drop(out_file);
+
+            // macOS/Linux: credentials 文件需要 600 权限
+            #[cfg(unix)]
+            {
+                if name == ".credentials.yaml" {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&out_path, fs::Permissions::from_mode(0o600));
+                }
+            }
             extracted += 1;
         }
     }
