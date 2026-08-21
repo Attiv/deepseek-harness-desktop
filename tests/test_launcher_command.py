@@ -3,12 +3,29 @@ import unittest
 
 
 class LauncherCommandTests(unittest.TestCase):
-    def test_pnpm_dlx_is_not_given_npx_yes_flag(self):
-        source = (Path(__file__).parents[1] / "src-tauri/src/main.rs").read_text()
+    def setUp(self):
+        self.source = (
+            Path(__file__).parents[1] / "src-tauri/src/main.rs"
+        ).read_text()
 
-        self.assertNotIn('"pnpm", "dlx", "-y"', source)
-        self.assertNotIn("pnpm dlx -y ", source)
-        self.assertNotIn('"$d/pnpm" dlx -y ', source)
+    def test_pnpm_dlx_is_not_given_npx_yes_flag(self):
+        self.assertNotIn('"pnpm", "dlx", "-y"', self.source)
+        self.assertNotIn("pnpm dlx -y ", self.source)
+        self.assertNotIn('"$d/pnpm" dlx -y ', self.source)
+
+    def test_all_real_exit_paths_stop_the_owned_backend(self):
+        self.assertRegex(
+            self.source,
+            r'(?s)"quit"\s*=>\s*\{.*?\bstop_owned_dsh\s*\(\s*app\s*\)\s*;',
+        )
+        self.assertRegex(self.source, r"\btauri::RunEvent::ExitRequested\b")
+        self.assertRegex(self.source, r"\btauri::RunEvent::Exit\b")
+
+    def test_unix_backend_uses_an_owned_process_group(self):
+        self.assertRegex(
+            self.source,
+            r"\bcmd\s*\.\s*process_group\s*\(\s*0\s*\)\s*;",
+        )
 
 
 if __name__ == "__main__":

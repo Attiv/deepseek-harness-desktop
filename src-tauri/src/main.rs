@@ -904,6 +904,48 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    struct UnixProcessGroupGuard {
+        child: Child,
+        pgid: libc::pid_t,
+    }
+
+    #[cfg(unix)]
+    impl Drop for UnixProcessGroupGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-self.pgid, libc::SIGKILL);
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminates_entire_unix_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        let child = Command::new("sh")
+            .args(["-c", "trap '' TERM; sleep 30 & wait"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn test process group");
+        let pgid = child.id() as libc::pid_t;
+        let mut group = UnixProcessGroupGuard { child, pgid };
+
+        terminate_child_tree(&mut group.child);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && unsafe { libc::kill(-pgid, 0) } == 0 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(
+            unsafe { libc::kill(-pgid, 0) },
+            0,
+            "owned process group should be gone"
+        );
+    }
+
     fn tags(pairs: &[(&str, &str)]) -> serde_json::Map<String, serde_json::Value> {
         pairs
             .iter()
