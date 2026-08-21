@@ -2,7 +2,7 @@
 
 一个把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Web 界面包装成**独立桌面应用**的 Tauri 壳。
 
-双击即可启动,不再需要手动执行 `pnpm dlx -y @deepseek-ai/dsh web`,也不会再被塞进浏览器标签页。
+双击即可启动,不再需要手动执行 `pnpm dlx @deepseek-ai/dsh web`,也不会再被塞进浏览器标签页。
 
 ## 下载安装
 
@@ -34,7 +34,7 @@
    ├─ 有 → 窗口直接导航到 dsh 界面(不查版本,零网络开销)
    └─ 无 → 查 registry 的 dist-tags,选出版本号最高的频道
             ↓
-            后台执行 pnpm dlx -y @deepseek-ai/dsh@<频道> web --no-open(隐藏窗口)
+            后台执行 pnpm dlx @deepseek-ai/dsh@<频道> web --no-open(隐藏窗口)
             ↓
             立刻显示加载页,轮询端口直到就绪(上限 10 分钟)
             ↓
@@ -62,10 +62,9 @@ pnpm 的缓存目录按 **spec 字符串**哈希。传 tag(`@next`)时所有版�
 原地升级;传精确版本(`@0.1.0-rc.8`)则每发一版就新建一个目录 —— dsh 一份装完约 **220 MB**,
 几个版本就是 1 GB 垃圾。
 
-### 关于 `-y`
+### 为什么没有 `-y`
 
-`pnpm dlx` 遇到没装过的包会问确认。壳把子进程 stdin 设为 null(非 TTY)并显式带 `-y`,
-自动跳过依赖询问,不让启动卡在确认上。这个确认发生在 dsh 启动之前,所以只能在命令行这一层解决。
+`-y` 是 `npx` 的确认选项，`pnpm dlx` 不支持它；pnpm 会直接安装并执行临时包，无需额外确认参数。
 
 ## 环境要求
 

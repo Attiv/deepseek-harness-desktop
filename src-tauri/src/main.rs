@@ -264,12 +264,11 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
         Err(_) => return None,
     };
 
-    // -y:自动确认,pnpm dlx 遇到没装过的包不弹确认。stdin 是 null(非 TTY)时本就不问,
-    // 显式给上是防用户配置里写了静默 no —— 那会让启动直接失败。
+    // pnpm dlx 会直接安装临时包，不需要 npx 的 `-y` 确认选项。
     // --no-open:桌面壳自己导航到 WebView,不让 dsh 再弹系统默认浏览器。
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd");
-        c.args(["/C", "pnpm", "dlx", "-y", spec, "web", "--no-open"]);
+        c.args(["/C", "pnpm", "dlx", spec, "web", "--no-open"]);
         c
     } else if cfg!(target_os = "macos") {
         // macOS: 用户的 pnpm 通常在 zsh 的 PATH 里(sh 读不进 .zshrc 的 zsh 语法,
@@ -277,12 +276,12 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
         // 用户的完整环境来执行,并兜底补常见 pnpm 安装位置。
         let script = format!(
             r#"if command -v pnpm >/dev/null 2>&1; then
-  pnpm dlx -y {spec} web --no-open
+  pnpm dlx {spec} web --no-open
   exit $?
 fi
 # pnpm 不在当前 PATH —— zsh + 常用安装路径都补一版,再找不到才报错
 for d in "$HOME/.local/share/pnpm" "$HOME/.tesh" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
-  [ -n "$d" ] && [ -x "$d/pnpm" ] && exec "$d/pnpm" dlx -y {spec} web --no-open
+  [ -n "$d" ] && [ -x "$d/pnpm" ] && exec "$d/pnpm" dlx {spec} web --no-open
 done
 echo "ERROR: pnpm not found. Install it: npm i -g pnpm or https://pnpm.io/installation" >&2
 exit 127"#,
@@ -305,11 +304,11 @@ exit 127"#,
             r#"[ -f "$HOME/.profile" ] && . "$HOME/.profile" 2>/dev/null || true
 [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null || true
 if command -v pnpm >/dev/null 2>&1; then
-  pnpm dlx -y {spec} web --no-open
+  pnpm dlx {spec} web --no-open
   exit $?
 fi
 for d in "$HOME/.local/share/pnpm" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
-  [ -n "$d" ] && [ -x "$d/pnpm" ] && exec "$d/pnpm" dlx -y {spec} web --no-open
+  [ -n "$d" ] && [ -x "$d/pnpm" ] && exec "$d/pnpm" dlx {spec} web --no-open
 done
 echo "ERROR: pnpm not found. Install it: npm i -g pnpm or https://pnpm.io/installation" >&2
 exit 127"#,
@@ -334,7 +333,7 @@ exit 127"#,
             let _ = fs::write(
                 &log,
                 format!(
-                    "[{}] dsh 启动中: pnpm dlx -y {} web, PID={}\n",
+                    "[{}] dsh 启动中: pnpm dlx {} web --no-open, PID={}\n",
                     chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
                     spec,
                     child.id()
@@ -684,7 +683,7 @@ code{{background:#16213e;padding:2px 6px;border-radius:3px;font-size:13px}}
 <p><strong>原因:</strong>{reason}</p>
 <p><strong>排查步骤:</strong></p>
 <p>1. 确认已安装 <a href="https://nodejs.org" style="color:#58a6ff">Node.js</a></p>
-<p>2. 在终端手动执行测试:<br><code>pnpm dlx -y @deepseek-ai/dsh web</code></p>
+<p>2. 在终端手动执行测试:<br><code>pnpm dlx @deepseek-ai/dsh web</code></p>
 <p>3. 查看日志文件:<br><code>~/.dsh/.dsh-app-launcher.log</code></p>
 </div>
 </body></html>"#,

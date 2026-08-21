@@ -34,7 +34,7 @@ jobs:
 
             ### 说明
             - 启动时自动解析 npm dist-tags,选版本最高的频道(rc 阶段跟 `next`,GA 后 `latest` 反超自动切回)
-            - 后端走 `npx -y @deepseek-ai/dsh@<频道> web`,官方发新版后下次启动自动升级,无需重新下载 App
+            - 后端走 `pnpm dlx @deepseek-ai/dsh@<频道> web --no-open`,官方发新版后下次启动自动升级,无需重新下载 App
             - 需要 **Node.js ≥ 22.19**(新版 dsh 依赖)
           draft: false
           prerelease: false
