@@ -32,6 +32,10 @@ const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
 /// 版本解析的网络预算。超时即回退到裸 spec,不让启动卡在这一步。
 const RESOLVE_TIMEOUT_SECS: u64 = 5;
+#[cfg(unix)]
+const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(400);
+const PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(400);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -363,46 +367,102 @@ exit 127"#,
     }
 }
 
+fn try_reap_child(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("failed to poll child {}: {error}", child.id());
+                return None;
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            eprintln!("timed out reaping child {}", child.id());
+            return None;
+        }
+        std::thread::sleep(PROCESS_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+    }
+}
+
 #[cfg(unix)]
 fn terminate_child_tree(child: &mut Child) {
     let Ok(pgid) = libc::pid_t::try_from(child.id()) else {
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Err(error) = child.kill() {
+            eprintln!("failed to terminate child with out-of-range pid: {error}");
+        }
+        let _ = try_reap_child(child, PROCESS_REAP_TIMEOUT);
         return;
     };
 
-    unsafe {
-        libc::kill(-pgid, libc::SIGTERM);
+    if unsafe { libc::kill(-pgid, libc::SIGTERM) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            eprintln!("failed to send SIGTERM to process group {pgid}: {error}");
+        }
     }
 
-    let deadline = Instant::now() + Duration::from_millis(400);
+    let deadline = Instant::now() + PROCESS_TERMINATION_GRACE;
     while Instant::now() < deadline {
         let group_exists = unsafe { libc::kill(-pgid, 0) } == 0;
-        if !group_exists
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        {
+        if !group_exists && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
             break;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        std::thread::sleep(Duration::from_millis(20).min(remaining));
+        std::thread::sleep(PROCESS_POLL_INTERVAL.min(remaining));
     }
 
     // Always target the process group: the shell may have exited while a stubborn
     // pnpm/node descendant is still alive in the group.
-    unsafe {
-        libc::kill(-pgid, libc::SIGKILL);
+    if unsafe { libc::kill(-pgid, libc::SIGKILL) } == -1 {
+        let group_error = std::io::Error::last_os_error();
+        if group_error.raw_os_error() != Some(libc::ESRCH) {
+            eprintln!("failed to send SIGKILL to process group {pgid}: {group_error}");
+        }
+        if let Err(error) = child.kill() {
+            eprintln!("failed to terminate direct child {}: {error}", child.id());
+        }
     }
-    let _ = child.wait();
+    let _ = try_reap_child(child, PROCESS_REAP_TIMEOUT);
 }
 
 #[cfg(target_os = "windows")]
 fn terminate_child_tree(child: &mut Child) {
     let pid = child.id().to_string();
-    let _ = Command::new("taskkill")
+    let tree_killed = match Command::new("taskkill")
         .args(["/PID", pid.as_str(), "/T", "/F"])
         .creation_flags(CREATE_NO_WINDOW)
-        .status();
-    let _ = child.wait();
+        .spawn()
+    {
+        Ok(mut taskkill) => match try_reap_child(&mut taskkill, PROCESS_REAP_TIMEOUT) {
+            Some(status) if status.success() => true,
+            Some(status) => {
+                eprintln!("taskkill failed for child {pid} with status {status}");
+                false
+            }
+            None => {
+                if let Err(error) = taskkill.kill() {
+                    eprintln!("failed to stop timed-out taskkill process: {error}");
+                }
+                let _ = try_reap_child(&mut taskkill, PROCESS_REAP_TIMEOUT);
+                false
+            }
+        },
+        Err(error) => {
+            eprintln!("failed to start taskkill for child {pid}: {error}");
+            false
+        }
+    };
+
+    if !tree_killed {
+        if let Err(error) = child.kill() {
+            eprintln!("failed to terminate direct child {pid}: {error}");
+        }
+    }
+    let _ = try_reap_child(child, PROCESS_REAP_TIMEOUT);
 }
 
 /// 递归添加文件/目录到 zip
@@ -961,16 +1021,22 @@ mod tests {
     #[cfg(unix)]
     struct UnixProcessGroupGuard {
         child: Child,
-        pgid: libc::pid_t,
+        pgid: Option<libc::pid_t>,
     }
 
     #[cfg(unix)]
     impl Drop for UnixProcessGroupGuard {
         fn drop(&mut self) {
-            unsafe {
-                libc::kill(-self.pgid, libc::SIGKILL);
+            if let Some(pgid) = self.pgid {
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            } else if matches!(self.child.try_wait(), Ok(None) | Err(_)) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
             }
-            let _ = self.child.wait();
         }
     }
 
@@ -987,7 +1053,10 @@ mod tests {
             .spawn()
             .expect("spawn test process group");
         let pgid = child.id() as libc::pid_t;
-        let mut group = UnixProcessGroupGuard { child, pgid };
+        let mut group = UnixProcessGroupGuard {
+            child,
+            pgid: Some(pgid),
+        };
 
         let mut ready = String::new();
         BufReader::new(
@@ -1027,6 +1096,33 @@ mod tests {
             probe_errno,
             Some(libc::ESRCH),
             "process-group probe should fail because the group no longer exists"
+        );
+        group.pgid = None;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn falls_back_to_direct_kill_when_process_group_kill_fails() {
+        let child = Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn child outside a dedicated process group");
+        let mut child = UnixProcessGroupGuard { child, pgid: None };
+        let started = Instant::now();
+
+        terminate_child_tree(&mut child.child);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "fallback termination must not wait for the child to exit naturally"
+        );
+        assert!(
+            child
+                .child
+                .try_wait()
+                .expect("probe fallback child")
+                .is_some(),
+            "fallback should reap the directly owned child"
         );
     }
 
