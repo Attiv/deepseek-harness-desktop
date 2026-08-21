@@ -11,6 +11,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
@@ -30,6 +32,11 @@ const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
 /// 版本解析的网络预算。超时即回退到裸 spec,不让启动卡在这一步。
 const RESOLVE_TIMEOUT_SECS: u64 = 5;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "windows")]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 struct DshChild(Mutex<Option<Child>>);
 
@@ -323,9 +330,14 @@ exit 127"#,
         .stdout(std::process::Stdio::from(log_file.try_clone().unwrap()))
         .stderr(std::process::Stdio::from(log_file));
 
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+
     #[cfg(target_os = "windows")]
     {
-        cmd.creation_flags(0x08000000);
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
 
     match cmd.spawn() {
@@ -349,6 +361,48 @@ exit 127"#,
             None
         }
     }
+}
+
+#[cfg(unix)]
+fn terminate_child_tree(child: &mut Child) {
+    let Ok(pgid) = libc::pid_t::try_from(child.id()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+
+    unsafe {
+        libc::kill(-pgid, libc::SIGTERM);
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < deadline {
+        let group_exists = unsafe { libc::kill(-pgid, 0) } == 0;
+        if !group_exists
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(Duration::from_millis(20).min(remaining));
+    }
+
+    // Always target the process group: the shell may have exited while a stubborn
+    // pnpm/node descendant is still alive in the group.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_child_tree(child: &mut Child) {
+    let pid = child.id().to_string();
+    let _ = Command::new("taskkill")
+        .args(["/PID", pid.as_str(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    let _ = child.wait();
 }
 
 /// 递归添加文件/目录到 zip
