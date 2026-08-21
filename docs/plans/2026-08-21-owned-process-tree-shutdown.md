@@ -48,11 +48,14 @@ fn terminates_entire_unix_process_group() {
 Extend `LauncherCommandTests` to require:
 
 ```python
-def test_all_real_exit_paths_stop_the_owned_backend(self):
+def test_menu_quit_stops_the_owned_backend(self):
     source = self.source
     self.assertIn('"quit" => {\n                    stop_owned_dsh(app);', source)
-    self.assertIn("tauri::RunEvent::ExitRequested", source)
+
+def test_final_tauri_exit_stops_the_owned_backend(self):
+    source = self.source
     self.assertIn("tauri::RunEvent::Exit", source)
+    self.assertNotIn("tauri::RunEvent::ExitRequested", source)
 
 def test_unix_backend_uses_an_owned_process_group(self):
     self.assertIn("cmd.process_group(0);", self.source)
@@ -69,7 +72,7 @@ python3 -m unittest tests/test_launcher_command.py -v
 cd src-tauri && cargo test terminates_entire_unix_process_group -- --nocapture
 ```
 
-Expected: Python assertions fail because lifecycle cleanup hooks/process groups are absent; Rust compilation fails because `terminate_child_tree` and direct `libc` usage are absent.
+Expected: Python assertions fail because menu/final-exit cleanup hooks and process groups are absent; Rust compilation fails because `terminate_child_tree` and direct `libc` usage are absent.
 
 **Step 4: Commit the failing tests**
 
@@ -165,7 +168,7 @@ fn stop_owned_dsh(app: &tauri::AppHandle) {
 }
 ```
 
-The `take()` makes cleanup idempotent across menu, `ExitRequested`, and `Exit` events.
+The `take()` makes cleanup idempotent across the menu handler and final `Exit` event.
 
 **Step 2: Replace inline menu cleanup**
 
@@ -177,13 +180,13 @@ Update the final `run` callback:
 
 ```rust
 .run(|app, event| {
-    if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+    if matches!(event, tauri::RunEvent::Exit) {
         stop_owned_dsh(app);
     }
 });
 ```
 
-Do not change `CloseRequested`: closing the main window must continue hiding it and preserving the backend.
+Do not clean up on the cancellable `RunEvent::ExitRequested`: the request may be cancelled, in which case the application and backend must both keep running. Do not change `CloseRequested`: closing the main window must continue hiding it and preserving the backend.
 
 **Step 4: Run source regressions to verify GREEN**
 
@@ -242,4 +245,3 @@ Confirm that no process-name-wide kill (`pkill`, `killall`, or equivalent) was i
 git add README.md
 git commit -m "docs: explain backend cleanup on exit"
 ```
-
