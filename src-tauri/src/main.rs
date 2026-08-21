@@ -20,40 +20,48 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 const DSH_PORT: u16 = 3080;
 const DSH_URL: &str = "http://127.0.0.1:3080";
-const BOOT_TIMEOUT_SECS: u64 = 180;
+/// 端口就绪的等待上限。切换频道或首次安装要下约 220 MB 的包,
+/// 慢网络下远超 3 分钟 —— 宁可多等,也别把一次正常的下载判成失败。
+const BOOT_TIMEOUT_SECS: u64 = 600;
+
+/// dsh 的 npm 包名。
+const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
+/// 解析版本时的兜底 registry(读不到 .npmrc 时用)。
+const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
+/// 版本解析的网络预算。超时即回退到裸 spec,不让启动卡在这一步。
+const RESOLVE_TIMEOUT_SECS: u64 = 5;
 
 struct DshChild(Mutex<Option<Child>>);
 
 /// 当前生效的快捷键(handler 动态读取,可在运行时更改)
 struct CurrentShortcut(Mutex<Shortcut>);
 
-/// 读取快捷键配置(~/.dsh/settings.yaml 里的 app-shortcut 字段)
-/// 返回 Tauri 快捷键字符串,如 "Ctrl+Shift+D" 或 "Cmd+Shift+D"
-fn read_shortcut() -> String {
-    let default = if cfg!(target_os = "macos") {
-        "Cmd+Shift+D".to_string()
-    } else {
-        "Ctrl+Shift+D".to_string()
-    };
-
-    let settings = dsh_home().join("settings.yaml");
-    let content = match fs::read_to_string(&settings) {
-        Ok(c) => c,
-        Err(_) => return default,
-    };
-
-    // 简单解析 yaml 里的 app-shortcut 行
+/// 从 ~/.dsh/settings.yaml 读一个顶层标量字段(与 write_shortcut 对称的简单行解析)。
+/// 字段缺失、文件不存在、值为空都返回 None。
+fn read_setting(key: &str) -> Option<String> {
+    let content = fs::read_to_string(dsh_home().join("settings.yaml")).ok()?;
+    let prefix = format!("{}:", key);
     for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("app-shortcut:") {
-            let val = trimmed["app-shortcut:".len()..].trim();
-            let val = val.trim_matches('"').trim_matches('\'');
+        if let Some(rest) = line.trim().strip_prefix(&prefix) {
+            let val = rest.trim().trim_matches('"').trim_matches('\'');
             if !val.is_empty() {
-                return val.to_string();
+                return Some(val.to_string());
             }
         }
     }
-    default
+    None
+}
+
+/// 读取快捷键配置(~/.dsh/settings.yaml 里的 app-shortcut 字段)
+/// 返回 Tauri 快捷键字符串,如 "Ctrl+Shift+D" 或 "Cmd+Shift+D"
+fn read_shortcut() -> String {
+    read_setting("app-shortcut").unwrap_or_else(|| {
+        if cfg!(target_os = "macos") {
+            "Cmd+Shift+D".to_string()
+        } else {
+            "Ctrl+Shift+D".to_string()
+        }
+    })
 }
 
 /// 写入快捷键配置到 ~/.dsh/settings.yaml
@@ -85,13 +93,17 @@ fn write_shortcut(shortcut: &str) -> Result<(), String> {
     fs::write(&settings, new_lines.join("\n") + "\n").map_err(|e| e.to_string())
 }
 
-/// 获取 DSH 配置目录 (~/.dsh)
-fn dsh_home() -> PathBuf {
-    let home = std::env::var("HOME")
+/// 获取用户主目录
+fn user_home() -> PathBuf {
+    std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    home.join(".dsh")
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// 获取 DSH 配置目录 (~/.dsh)
+fn dsh_home() -> PathBuf {
+    user_home().join(".dsh")
 }
 
 fn log_path() -> PathBuf {
@@ -130,8 +142,117 @@ fn dsh_running() -> bool {
     }
 }
 
+/// spec 片段(dist-tag 名或版本号)是否只含安全字符。
+/// 这个值会拼进 `cmd /C` 与 `sh -c` 的命令行,配置文件不能成为注入点。
+fn is_safe_spec_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+}
+
+/// 解析查询版本用的 registry:先看 ~/.npmrc 的 scope 专属 registry,
+/// 再看全局 `registry=`,再看环境变量,最后回落官方源。
+/// 配了 npmmirror 等镜像的用户在这里也能正常解析到版本。
+fn npm_registry() -> String {
+    let mut global: Option<String> = None;
+    if let Ok(content) = fs::read_to_string(user_home().join(".npmrc")) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some(v) = trimmed.strip_prefix("@deepseek-ai:registry=") {
+                return v.trim().trim_end_matches('/').to_string();
+            }
+            if let Some(v) = trimmed.strip_prefix("registry=") {
+                global = Some(v.trim().trim_end_matches('/').to_string());
+            }
+        }
+    }
+    global
+        .or_else(|| std::env::var("npm_config_registry").ok())
+        .map(|v| v.trim_end_matches('/').to_string())
+        .filter(|v| v.starts_with("http"))
+        .unwrap_or_else(|| DEFAULT_REGISTRY.to_string())
+}
+
+/// 查 registry 的 dist-tags,返回**承载最高语义化版本的那个 tag 名**。
+///
+/// 官方在 rc 阶段把新版发到 `next`,`latest` 会落后(写这段时 latest=0.1.0-rc.7、
+/// next=0.1.0-rc.8),所以裸 spec 永远只拿 rc.7;GA 之后 `latest` 又会反超 `next`。
+/// 只有比较各 tag 实际指向的版本,两个方向才都成立。
+fn newest_channel() -> Option<String> {
+    let url = format!("{}/{}", npm_registry(), DSH_PACKAGE.replace('/', "%2f"));
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(RESOLVE_TIMEOUT_SECS))
+        .build()
+        .ok()?;
+    // 用 text() 而不是 json():reqwest 的 json 特性没开,serde_json 本来就在依赖里
+    let raw_body = client
+        .get(&url)
+        // 精简 packument:只回 dist-tags/versions,省掉整包元数据
+        .header("Accept", "application/vnd.npm.install-v1+json")
+        .send()
+        .ok()?
+        .text()
+        .ok()?;
+    let body: serde_json::Value = serde_json::from_str(&raw_body).ok()?;
+
+    let tags = body.get("dist-tags")?.as_object()?;
+    pick_newest_tag(tags)
+}
+
+/// 从 dist-tags 里挑出承载最高版本的 tag 名。与网络分离,便于测试。
+fn pick_newest_tag(tags: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let mut best: Option<(semver::Version, String)> = None;
+    for (tag, raw) in tags {
+        if !is_safe_spec_token(tag) {
+            continue;
+        }
+        let version = match raw.as_str().and_then(|v| semver::Version::parse(v).ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let better = match &best {
+            None => true,
+            // 版本相同时偏向 latest:少切一个 npx 缓存目录
+            Some((best_version, best_tag)) => {
+                version > *best_version
+                    || (version == *best_version
+                        && tag.as_str() == "latest"
+                        && best_tag.as_str() != "latest")
+            }
+        };
+        if better {
+            best = Some((version, tag.to_string()));
+        }
+    }
+    best.map(|(_, tag)| tag)
+}
+
+/// 决定这次启动喂给 npx 的 spec。
+///
+/// 默认自动选最新频道,用户无需确认任何东西。可在 ~/.dsh/settings.yaml 覆盖:
+/// `app-dsh-channel: newest`(默认)| `latest` | `next` | 精确版本如 `0.1.0-rc.7`。
+///
+/// 为什么传 tag 而不是精确版本:npx 的缓存目录按 spec 字符串哈希。传 tag 时所有版本
+/// 共用一个目录(dsh 约 220 MB),由 npx 原地升级;传精确版本会每发一版就多一个
+/// 220 MB 目录,磁盘无上限增长。
+fn resolve_dsh_spec() -> String {
+    if let Some(pin) = read_setting("app-dsh-channel") {
+        if pin != "newest" && is_safe_spec_token(&pin) {
+            return format!("{}@{}", DSH_PACKAGE, pin);
+        }
+    }
+    match newest_channel() {
+        Some(tag) => format!("{}@{}", DSH_PACKAGE, tag),
+        // 解析失败(离线/私有源/网络受限)就退回裸 spec:它对应的 npx 缓存目录
+        // 通常早就装好了,能离线秒起,而不是卡在一次注定失败的下载上
+        None => DSH_PACKAGE.to_string(),
+    }
+}
+
 /// 拉起 npx @deepseek-ai/dsh web
-fn spawn_dsh() -> Option<Child> {
+fn spawn_dsh(spec: &str) -> Option<Child> {
     let log = log_path();
     let log_file = match fs::OpenOptions::new()
         .create(true)
@@ -143,16 +264,19 @@ fn spawn_dsh() -> Option<Child> {
         Err(_) => return None,
     };
 
+    // -y:跳过 npx 的 "Ok to proceed?" 确认。stdin 是 null(非 TTY)时 npx 本就不问,
+    // 显式给上是防用户 .npmrc 里写了 yes=false —— 那会让启动直接失败。
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd");
-        c.args(["/C", "npx", "@deepseek-ai/dsh", "web"]);
+        c.args(["/C", "npx", "-y", spec, "web"]);
         c
     } else {
+        let script = format!(
+            "source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true; npx -y {} web",
+            spec
+        );
         let mut c = Command::new("sh");
-        c.args([
-            "-c",
-            "source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true; npx @deepseek-ai/dsh web",
-        ]);
+        c.args(["-c", script.as_str()]);
         c
     };
 
@@ -170,8 +294,9 @@ fn spawn_dsh() -> Option<Child> {
             let _ = fs::write(
                 &log,
                 format!(
-                    "[{}] dsh 启动中, PID={}\n",
+                    "[{}] dsh 启动中: npx -y {} web, PID={}\n",
                     chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    spec,
                     child.id()
                 ),
             );
@@ -539,7 +664,8 @@ fn main() {
     let mut child = if dsh_running() {
         None
     } else {
-        spawn_dsh()
+        // 只有真要拉起后端时才去解析版本,复用已在跑的实例不付这次网络开销
+        spawn_dsh(&resolve_dsh_spec())
     };
     let had_child = child.is_some();
 
@@ -608,12 +734,21 @@ fn main() {
 
             let window = main_window.clone();
             tauri::async_runtime::spawn(async move {
-                let deadline = Instant::now() + Duration::from_secs(BOOT_TIMEOUT_SECS);
+                let started = Instant::now();
+                let deadline = started + Duration::from_secs(BOOT_TIMEOUT_SECS);
+                // 后端没在跑时:短暂等待后就把加载页显示出来。切换 spec 或首次安装要下
+                // 约 220 MB,让用户全程盯着空白桌面(甚至怀疑没启动)是不可接受的。
+                let reveal_at = started + Duration::from_secs(if had_child { 3 } else { 0 });
+                let mut revealed = false;
 
                 loop {
+                    if !revealed && Instant::now() >= reveal_at {
+                        let _ = window.show();
+                        revealed = true;
+                    }
                     if Instant::now() > deadline {
                         let reason = if had_child {
-                            "npx 已启动但 dsh web 长时间未就绪(超过 180 秒)。可能是首次下载较慢,或 dsh 启动报错。"
+                            "npx 已启动但 dsh web 长时间未就绪(超过 10 分钟)。可能是下载被网络卡住,或 dsh 启动报错 —— 请看日志。"
                         } else {
                             "无法启动 npx 进程。请确认已安装 Node.js。"
                         };
@@ -724,4 +859,80 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("构建 Tauri 应用失败")
         .run(|_app, _event| {});
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tags(pairs: &[(&str, &str)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), serde_json::Value::String((*v).to_string())))
+            .collect()
+    }
+
+    /// 当下的真实局面:rc 阶段 next 领先 latest,必须选 next(否则永远停在 rc.7)
+    #[test]
+    fn prefers_next_when_it_leads_during_rc() {
+        let t = tags(&[("latest", "0.1.0-rc.7"), ("next", "0.1.0-rc.8")]);
+        assert_eq!(pick_newest_tag(&t).as_deref(), Some("next"));
+    }
+
+    /// GA 之后的局面:latest 反超,必须选 latest —— 不能把 next 写死
+    #[test]
+    fn prefers_latest_after_ga_overtakes() {
+        let t = tags(&[("latest", "0.1.0"), ("next", "0.1.0-rc.8")]);
+        assert_eq!(pick_newest_tag(&t).as_deref(), Some("latest"));
+    }
+
+    /// rc 编号按数字比,不能按字典序(rc.10 > rc.9)
+    #[test]
+    fn compares_prerelease_numbers_numerically() {
+        let t = tags(&[("latest", "0.1.0-rc.9"), ("next", "0.1.0-rc.10")]);
+        assert_eq!(pick_newest_tag(&t).as_deref(), Some("next"));
+    }
+
+    /// 版本并列时偏向 latest,避免多占一个 npx 缓存目录
+    #[test]
+    fn breaks_ties_toward_latest() {
+        let t = tags(&[("next", "0.1.0"), ("latest", "0.1.0")]);
+        assert_eq!(pick_newest_tag(&t).as_deref(), Some("latest"));
+        let reversed = tags(&[("latest", "0.1.0"), ("next", "0.1.0")]);
+        assert_eq!(pick_newest_tag(&reversed).as_deref(), Some("latest"));
+    }
+
+    /// 解析不了的版本号与危险 tag 名一律跳过,不能被带进 shell 命令行
+    #[test]
+    fn skips_unparsable_versions_and_unsafe_tag_names() {
+        let t = tags(&[
+            ("latest", "not-a-version"),
+            ("weird tag; rm -rf /", "9.9.9"),
+            ("next", "0.1.0-rc.8"),
+        ]);
+        assert_eq!(pick_newest_tag(&t).as_deref(), Some("next"));
+        assert!(pick_newest_tag(&tags(&[])).is_none());
+    }
+
+    #[test]
+    fn spec_token_safety_rejects_shell_metacharacters() {
+        assert!(is_safe_spec_token("0.1.0-rc.8"));
+        assert!(is_safe_spec_token("next"));
+        assert!(!is_safe_spec_token(""));
+        assert!(!is_safe_spec_token("a b"));
+        assert!(!is_safe_spec_token("x&calc"));
+        assert!(!is_safe_spec_token("$(id)"));
+        assert!(!is_safe_spec_token("a|b"));
+    }
+
+    /// 打通真实 registry 的解析链路。会联网,默认不跑:
+    /// `cargo test -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn resolves_against_live_registry() {
+        let channel = newest_channel().expect("registry 应能解析出最新频道");
+        println!("registry = {}", npm_registry());
+        println!("newest channel = {} -> spec {}@{}", channel, DSH_PACKAGE, channel);
+        assert!(is_safe_spec_token(&channel));
+    }
 }

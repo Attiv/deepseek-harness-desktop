@@ -17,6 +17,13 @@
 <body>
   <div class="spinner"></div>
   <div class="t">正在启动 DeepSeek Harness…</div>
-  <div class="s">npx @deepseek-ai/dsh web</div>
+  <div class="s">npx -y @deepseek-ai/dsh@&lt;最新频道&gt; web</div>
+  <div class="s" id="hint" style="opacity:0;transition:opacity .8s">首次启动或版本更新需先下载约 220 MB,请耐心等待</div>
+  <script>
+    // 只在等得久了才提示下载,正常秒起时不吓人
+    setTimeout(function () {
+      document.getElementById('hint').style.opacity = '.5';
+    }, 8000);
+  </script>
 </body>
 </html>
