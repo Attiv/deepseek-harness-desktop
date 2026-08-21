@@ -17,13 +17,18 @@
 <body>
   <div class="spinner"></div>
   <div class="t">正在启动 DeepSeek Harness…</div>
-  <div class="s">npx -y @deepseek-ai/dsh@&lt;最新频道&gt; web</div>
+  <div class="s">pnpm dlx -y @deepseek-ai/dsh@&lt;最新频道&gt; web --no-open</div>
   <div class="s" id="hint" style="opacity:0;transition:opacity .8s">首次启动或版本更新需先下载约 220 MB,请耐心等待</div>
+  <div class="s" id="hint2" style="opacity:0;transition:opacity .8s;color:#ff8c69">若长时间未就绪,请确认已安装 Node.js 与 pnpm → https://pnpm.io/zh/installation</div>
   <script>
     // 只在等得久了才提示下载,正常秒起时不吓人
     setTimeout(function () {
       document.getElementById('hint').style.opacity = '.5';
     }, 8000);
+    // 超过 30 秒仍未就绪,提示安装 pnpm
+    setTimeout(function () {
+      document.getElementById('hint2').style.opacity = '1';
+    }, 30000);
   </script>
 </body>
 </html>
