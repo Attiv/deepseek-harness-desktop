@@ -1090,7 +1090,10 @@ mod tests {
             panic!("poison DshChild mutex for recovery test");
         })
         .join();
-        assert!(poison_result.is_err(), "test thread should poison the mutex");
+        assert!(
+            poison_result.is_err(),
+            "test thread should poison the mutex"
+        );
 
         let child = take_owned_child(&state).expect("recover and take poisoned child");
         let mut child = UnixProcessGroupGuard {
