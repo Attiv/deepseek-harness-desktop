@@ -44,23 +44,23 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 struct DshChild(Mutex<Option<Child>>);
 
+fn take_owned_child(state: &DshChild) -> Option<Child> {
+    let mut owned_child = match state.0.lock() {
+        Ok(owned_child) => owned_child,
+        Err(poisoned) => {
+            eprintln!("DshChild mutex was poisoned while taking backend ownership");
+            poisoned.into_inner()
+        }
+    };
+    owned_child.take()
+}
+
 fn stop_owned_dsh(app: &tauri::AppHandle) {
     let Some(state) = app.try_state::<DshChild>() else {
         return;
     };
 
-    let child = {
-        let mut owned_child = match state.0.lock() {
-            Ok(owned_child) => owned_child,
-            Err(poisoned) => {
-                eprintln!("DshChild mutex was poisoned while stopping backend");
-                poisoned.into_inner()
-            }
-        };
-        owned_child.take()
-    };
-
-    if let Some(mut child) = child {
+    if let Some(mut child) = take_owned_child(&state) {
         terminate_child_tree(&mut child);
     }
 }
@@ -835,14 +835,6 @@ fn main() {
         }
     });
 
-    let mut child = if dsh_running() {
-        None
-    } else {
-        // 只有真要拉起后端时才去解析版本,复用已在跑的实例不付这次网络开销
-        spawn_dsh(&resolve_dsh_spec())
-    };
-    let had_child = child.is_some();
-
     // 读取用户配置的快捷键
     let shortcut_str = read_shortcut();
     let shortcut: Shortcut = shortcut_str
@@ -860,6 +852,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![set_shortcut_cmd, close_shortcut_window])
         .manage(CurrentShortcut(Mutex::new(shortcut)))
+        .manage(DshChild(Mutex::new(None)))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, sc, event| {
@@ -905,6 +898,30 @@ fn main() {
             .center()
             .visible(false)
             .build()?;
+
+            let child = if dsh_running() {
+                None
+            } else {
+                // 只有真要拉起后端时才去解析版本,复用已在跑的实例不付这次网络开销
+                spawn_dsh(&resolve_dsh_spec())
+            };
+            let had_child = child.is_some();
+
+            let Some(state) = app.try_state::<DshChild>() else {
+                if let Some(mut child) = child {
+                    terminate_child_tree(&mut child);
+                }
+                return Err("DshChild state unavailable after backend startup".into());
+            };
+            let mut owned_child = match state.0.lock() {
+                Ok(owned_child) => owned_child,
+                Err(poisoned) => {
+                    eprintln!("DshChild mutex was poisoned while storing backend ownership");
+                    poisoned.into_inner()
+                }
+            };
+            *owned_child = child;
+            drop(owned_child);
 
             let window = main_window.clone();
             tauri::async_runtime::spawn(async move {
@@ -1001,7 +1018,6 @@ fn main() {
                 _ => {}
             }
         })
-        .manage(DshChild(Mutex::new(child.take())))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
@@ -1015,10 +1031,7 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("构建 Tauri 应用失败")
         .run(|app, event| {
-            if matches!(
-                event,
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-            ) {
+            if matches!(event, tauri::RunEvent::Exit) {
                 stop_owned_dsh(app);
             }
         });
@@ -1027,6 +1040,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn taking_an_absent_owned_child_returns_none() {
+        let state = DshChild(Mutex::new(None));
+
+        assert!(take_owned_child(&state).is_none());
+    }
 
     #[cfg(unix)]
     struct UnixProcessGroupGuard {
@@ -1048,6 +1068,42 @@ mod tests {
                 let _ = self.child.wait();
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn taking_a_child_recovers_from_a_poisoned_mutex_and_is_idempotent() {
+        use std::os::unix::process::CommandExt;
+        use std::sync::Arc;
+
+        let child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn owned child");
+        let pgid = child.id() as libc::pid_t;
+        let state = Arc::new(DshChild(Mutex::new(Some(child))));
+        let poison_target = Arc::clone(&state);
+
+        let poison_result = std::thread::spawn(move || {
+            let _guard = poison_target.0.lock().expect("lock child before poisoning");
+            panic!("poison DshChild mutex for recovery test");
+        })
+        .join();
+        assert!(poison_result.is_err(), "test thread should poison the mutex");
+
+        let child = take_owned_child(&state).expect("recover and take poisoned child");
+        let mut child = UnixProcessGroupGuard {
+            child,
+            pgid: Some(pgid),
+        };
+        assert!(
+            take_owned_child(&state).is_none(),
+            "taking the same owned child twice must be idempotent"
+        );
+
+        terminate_child_tree(&mut child.child);
+        child.pgid = None;
     }
 
     #[cfg(unix)]
