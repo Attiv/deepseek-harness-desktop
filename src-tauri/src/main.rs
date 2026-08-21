@@ -271,10 +271,49 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
         let mut c = Command::new("cmd");
         c.args(["/C", "pnpm", "dlx", "-y", spec, "web", "--no-open"]);
         c
-    } else {
+    } else if cfg!(target_os = "macos") {
+        // macOS: 用户的 pnpm 通常在 zsh 的 PATH 里(sh 读不进 .zshrc 的 zsh 语法,
+        // 也带不出 nvm/volta 这些)。桌面 shell 不能凭空假设 PATH,所以用 zsh 加载
+        // 用户的完整环境来执行,并兜底补常见 pnpm 安装位置。
         let script = format!(
-            "source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true; pnpm dlx -y {} web --no-open",
-            spec
+            r#"if command -v pnpm >/dev/null 2>&1; then
+  pnpm dlx -y {spec} web --no-open
+  exit $?
+fi
+# pnpm 不在当前 PATH —— zsh + 常用安装路径都补一版,再找不到才报错
+for d in "$HOME/.local/share/pnpm" "$HOME/.tesh" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
+  [ -n "$d" ] && [ -x "$d/pnpm" ] && exec "$d/pnpm" dlx -y {spec} web --no-open
+done
+echo "ERROR: pnpm not found. Install it: npm i -g pnpm or https://pnpm.io/installation" >&2
+exit 127"#,
+            spec = spec
+        );
+        // 用 zsh 执行以加载用户完整环境;缺 zsh 时退回 sh
+        const ZSH: &str = "/bin/zsh";
+        if std::path::Path::new(ZSH).exists() {
+            let mut c = Command::new(ZSH);
+            c.args(["-c", script.as_str()]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", script.as_str()]);
+            c
+        }
+    } else {
+        // Linux: 用户的 pnpm 常在 .bashrc/.profile,这里 source 后再跑
+        let script = format!(
+            r#"[ -f "$HOME/.profile" ] && . "$HOME/.profile" 2>/dev/null || true
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null || true
+if command -v pnpm >/dev/null 2>&1; then
+  pnpm dlx -y {spec} web --no-open
+  exit $?
+fi
+for d in "$HOME/.local/share/pnpm" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
+  [ -n "$d" ] && [ -x "$d/pnpm" ] && exec "$d/pnpm" dlx -y {spec} web --no-open
+done
+echo "ERROR: pnpm not found. Install it: npm i -g pnpm or https://pnpm.io/installation" >&2
+exit 127"#,
+            spec = spec
         );
         let mut c = Command::new("sh");
         c.args(["-c", script.as_str()]);
