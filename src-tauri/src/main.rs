@@ -923,26 +923,56 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminates_entire_unix_process_group() {
+        use std::io::{BufRead, BufReader};
         use std::os::unix::process::CommandExt;
 
         let child = Command::new("sh")
-            .args(["-c", "trap '' TERM; sleep 30 & wait"])
+            .args(["-c", "trap '' TERM; sleep 30 & echo READY; wait"])
             .process_group(0)
+            .stdout(Stdio::piped())
             .spawn()
             .expect("spawn test process group");
         let pgid = child.id() as libc::pid_t;
         let mut group = UnixProcessGroupGuard { child, pgid };
 
+        let mut ready = String::new();
+        BufReader::new(
+            group
+                .child
+                .stdout
+                .as_mut()
+                .expect("capture test shell readiness"),
+        )
+        .read_line(&mut ready)
+        .expect("read test shell readiness");
+        assert_eq!(ready.trim_end(), "READY");
+
+        let timeout = Duration::from_secs(2);
+        let started = Instant::now();
         terminate_child_tree(&mut group.child);
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && unsafe { libc::kill(-pgid, 0) } == 0 {
-            std::thread::sleep(Duration::from_millis(20));
+        let mut probe = unsafe { libc::kill(-pgid, 0) };
+        while probe == 0 && started.elapsed() < timeout {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            std::thread::sleep(Duration::from_millis(20).min(remaining));
+            probe = unsafe { libc::kill(-pgid, 0) };
         }
-        assert_ne!(
-            unsafe { libc::kill(-pgid, 0) },
-            0,
-            "owned process group should be gone"
+        let probe_errno = if probe == -1 {
+            std::io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed <= timeout,
+            "process-tree termination exceeded two seconds: {elapsed:?}"
+        );
+        assert_eq!(probe, -1, "owned process group should be gone");
+        assert_eq!(
+            probe_errno,
+            Some(libc::ESRCH),
+            "process-group probe should fail because the group no longer exists"
         );
     }
 
