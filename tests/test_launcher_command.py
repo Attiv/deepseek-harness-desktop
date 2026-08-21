@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import unittest
 
 
@@ -14,9 +15,15 @@ class LauncherCommandTests(unittest.TestCase):
         self.assertNotIn('"$d/pnpm" dlx -y ', self.source)
 
     def test_all_real_exit_paths_stop_the_owned_backend(self):
-        self.assertRegex(
+        quit_handler = re.search(
+            r'"quit"\s*=>\s*\{(?P<body>.*?)\bapp\s*\.\s*exit\s*\(\s*0\s*\)\s*;',
             self.source,
-            r'(?s)"quit"\s*=>\s*\{.*?\bstop_owned_dsh\s*\(\s*app\s*\)\s*;',
+            re.DOTALL,
+        )
+        self.assertIsNotNone(quit_handler, "quit handler should call app.exit(0)")
+        self.assertRegex(
+            quit_handler.group("body"),
+            r"\bstop_owned_dsh\s*\(\s*app\s*\)\s*;",
         )
         self.assertRegex(self.source, r"\btauri::RunEvent::ExitRequested\b")
         self.assertRegex(self.source, r"\btauri::RunEvent::Exit\b")
