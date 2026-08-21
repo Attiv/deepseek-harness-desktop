@@ -44,6 +44,27 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 struct DshChild(Mutex<Option<Child>>);
 
+fn stop_owned_dsh(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<DshChild>() else {
+        return;
+    };
+
+    let child = {
+        let mut owned_child = match state.0.lock() {
+            Ok(owned_child) => owned_child,
+            Err(poisoned) => {
+                eprintln!("DshChild mutex was poisoned while stopping backend");
+                poisoned.into_inner()
+            }
+        };
+        owned_child.take()
+    };
+
+    if let Some(mut child) = child {
+        terminate_child_tree(&mut child);
+    }
+}
+
 /// 当前生效的快捷键(handler 动态读取,可在运行时更改)
 struct CurrentShortcut(Mutex<Shortcut>);
 
@@ -966,25 +987,7 @@ fn main() {
                     return;
                 }
                 "quit" => {
-                    // 退出前 kill 掉 pnpm/dsh 整个进程树
-                    if let Some(state) = app.try_state::<DshChild>() {
-                        if let Some(mut child) = state.0.lock().unwrap().take() {
-                            let pid = child.id();
-                            // Windows: taskkill /T /F 递归 kill 进程树
-                            // macOS/Linux: kill 整个进程组
-                            #[cfg(target_os = "windows")]
-                            {
-                                let _ = Command::new("taskkill")
-                                    .args(["/PID", &pid.to_string(), "/T", "/F"])
-                                    .creation_flags(0x08000000)
-                                    .output();
-                            }
-                            #[cfg(not(target_os = "windows"))]
-                            {
-                                let _ = child.kill();
-                            }
-                        }
-                    }
+                    stop_owned_dsh(app);
                     app.exit(0);
                     return;
                 }
@@ -1011,7 +1014,14 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("构建 Tauri 应用失败")
-        .run(|_app, _event| {});
+        .run(|app, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                stop_owned_dsh(app);
+            }
+        });
 }
 
 #[cfg(test)]
