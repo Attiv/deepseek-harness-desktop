@@ -266,13 +266,14 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
 
     // -y:跳过 npx 的 "Ok to proceed?" 确认。stdin 是 null(非 TTY)时 npx 本就不问,
     // 显式给上是防用户 .npmrc 里写了 yes=false —— 那会让启动直接失败。
+    // --no-open:桌面壳自己导航到 WebView,不让 dsh 再弹系统默认浏览器。
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd");
-        c.args(["/C", "npx", "-y", spec, "web"]);
+        c.args(["/C", "npx", "-y", spec, "web", "--no-open"]);
         c
     } else {
         let script = format!(
-            "source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true; npx -y {} web",
+            "source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true; npx -y {} web --no-open",
             spec
         );
         let mut c = Command::new("sh");
