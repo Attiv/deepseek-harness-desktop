@@ -2,7 +2,7 @@
 
 一个把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Web 界面包装成**独立桌面应用**的 Tauri 壳。
 
-双击即可启动,不再需要手动执行 `npx @deepseek-ai/dsh web`,也不会再被塞进浏览器标签页。
+双击即可启动,不再需要手动执行 `pnpm dlx -y @deepseek-ai/dsh web`,也不会再被塞进浏览器标签页。
 
 ## 下载安装
 
@@ -15,13 +15,13 @@
 | **macOS (Intel)** | `*_x64.dmg` | Intel 芯片 |
 | **Linux** | `*.AppImage` 或 `*.deb` | 直接运行或安装 |
 
-> ⚠️ 运行时需要系统已安装 [Node.js](https://nodejs.org/)(用于 `npx` 拉起 dsh 后端)
+> ⚠️ 运行时需要系统已安装 [Node.js](https://nodejs.org/) + [pnpm](https://pnpm.io/)(用于 `pnpm dlx` 拉起 dsh 后端)
 
 ## 特性
 
 - 🖥️ **独立桌面窗口** — 基于 Tauri v2 + 系统原生 WebView,自带标题栏,像原生 App 一样
 - ⚡ **轻量** — 编译产物约 3 MB(对比 Electron 动辄上百 MB)
-- 🔄 **自动跟随最新版** — 启动时查 npm dist-tags,自动选**版本号最高的那个频道**再交给 `npx`,无需用户确认任何东西。官方在 rc 阶段把新版发在 `next`(`latest` 会落后一截),裸 `npx @deepseek-ai/dsh` 拿不到,这里能拿到
+- 🔄 **自动跟随最新版** — 启动时查 npm dist-tags,自动选**版本号最高的那个频道**再交给 `pnpm dlx`,无需用户确认任何东西。官方在 rc 阶段把新版发在 `next`(`latest` 会落后一截),裸 `npx @deepseek-ai/dsh` 拿不到,这里能拿到
 - 🚀 **智能启动** — 检测已有实例则直接复用,否则后台拉起(无黑框),轮询端口就绪后显示窗口
 - 🌐 **跨平台** — Windows / macOS / Linux 全支持
 
@@ -34,14 +34,14 @@
    ├─ 有 → 窗口直接导航到 dsh 界面(不查版本,零网络开销)
    └─ 无 → 查 registry 的 dist-tags,选出版本号最高的频道
             ↓
-            后台执行 npx -y @deepseek-ai/dsh@<频道> web(隐藏窗口)
+            后台执行 pnpm dlx -y @deepseek-ai/dsh@<频道> web --no-open(隐藏窗口)
             ↓
             立刻显示加载页,轮询端口直到就绪(上限 10 分钟)
             ↓
             窗口导航到 http://127.0.0.1:3080 并显示
 ```
 
-关键点:**真正的 dsh 仍然由 `npx` 拉起**,因此官方更新 dsh 时,桌面壳自动跟随升级,无需重新打包。
+关键点:**真正的 dsh 仍然由 `pnpm dlx` 拉起**,因此官方更新 dsh 时,桌面壳自动跟随升级,无需重新打包。
 
 ### 为什么要自己选频道
 
@@ -53,20 +53,19 @@ $ npm view @deepseek-ai/dsh dist-tags
 ```
 
 裸 `npx @deepseek-ai/dsh` 解析的是 `latest`,所以只会拿到 rc.7 —— 加 `@latest` 也一样。
-壳启动时比较各个 tag 实际指向的版本号(按 semver,`rc.10 > rc.9`),挑最高的那个 tag 传给 npx,
+壳启动时比较各个 tag 实际指向的版本号(按 semver,`rc.10 > rc.9`),挑最高的那个 tag 传给 pnpm dlx,
 于是 rc 阶段跟到 `next`,GA 之后 `latest` 反超时又自动切回去,两个方向都成立。
 
 ### 为什么传 tag 而不是精确版本号
 
-npx 的缓存目录按 **spec 字符串**哈希。传 tag(`@next`)时所有版本共用同一个目录,由 npx
+pnpm 的缓存目录按 **spec 字符串**哈希。传 tag(`@next`)时所有版本共用同一个目录,由 pnpm
 原地升级;传精确版本(`@0.1.0-rc.8`)则每发一版就新建一个目录 —— dsh 一份装完约 **220 MB**,
 几个版本就是 1 GB 垃圾。
 
 ### 关于 `-y`
 
-`npx` 遇到没装过的包会问 `Ok to proceed? (y)`。壳把子进程 stdin 设为 null(非 TTY),
-npx 此时本就不问、直接装;显式带上 `-y` 是防止用户 `.npmrc` 里写了 `yes=false` —— 那会让启动
-直接失败。这个确认发生在 dsh 启动之前,由 npm 而非 dsh 处理,所以只能在命令行这一层解决。
+`pnpm dlx` 遇到没装过的包会问确认。壳把子进程 stdin 设为 null(非 TTY)并显式带 `-y`,
+自动跳过依赖询问,不让启动卡在确认上。这个确认发生在 dsh 启动之前,所以只能在命令行这一层解决。
 
 ## 环境要求
 
@@ -75,7 +74,7 @@ npx 此时本就不问、直接装;显式带上 `-y` 是防止用户 `.npmrc` �
 | Windows 10/11 | WebView2 Runtime | Win11 自带,Win10 通常已装 |
 | macOS | 无额外依赖 | 使用系统自带 WKWebView |
 | Linux | WebKitGTK | 主流发行版通常已装 |
-| **所有平台** | **Node.js ≥ 22.19 + npm** | 用于 `npx` 拉起 dsh 后端 |
+| **所有平台** | **Node.js ≥ 22.19 + pnpm** | 用于 `pnpm dlx` 拉起 dsh 后端 |
 
 > dsh 0.1.0-rc.8 的传递依赖 `@earendil-works/pi-ai` 声明 `node >= 22.19.0`。
 > npm 默认不强制 engines,实测 Node 22.16 也能起来(只是 `npm warn EBADENGINE`),

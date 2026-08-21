@@ -1,5 +1,5 @@
 // DeepSeek Harness - Tauri 桌面壳
-// 启动 npx @deepseek-ai/dsh web,窗口加载 127.0.0.1:3080
+// 启动 pnpm dlx @deepseek-ai/dsh web,窗口加载 127.0.0.1:3080
 // 支持导出/导入 dsh 配置(settings/credentials/skills/profiles/storages)
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -214,7 +214,7 @@ fn pick_newest_tag(tags: &serde_json::Map<String, serde_json::Value>) -> Option<
         };
         let better = match &best {
             None => true,
-            // 版本相同时偏向 latest:少切一个 npx 缓存目录
+            // 版本相同时偏向 latest:少切一个 pnpm 缓存目录
             Some((best_version, best_tag)) => {
                 version > *best_version
                     || (version == *best_version
@@ -229,13 +229,13 @@ fn pick_newest_tag(tags: &serde_json::Map<String, serde_json::Value>) -> Option<
     best.map(|(_, tag)| tag)
 }
 
-/// 决定这次启动喂给 npx 的 spec。
+/// 决定这次启动喂给 pnpm 的 spec。
 ///
 /// 默认自动选最新频道,用户无需确认任何东西。可在 ~/.dsh/settings.yaml 覆盖:
 /// `app-dsh-channel: newest`(默认)| `latest` | `next` | 精确版本如 `0.1.0-rc.7`。
 ///
-/// 为什么传 tag 而不是精确版本:npx 的缓存目录按 spec 字符串哈希。传 tag 时所有版本
-/// 共用一个目录(dsh 约 220 MB),由 npx 原地升级;传精确版本会每发一版就多一个
+/// 为什么传 tag 而不是精确版本:pnpm 的缓存目录按 spec 哈希。传 tag 时所有版本
+/// 共用一个目录(dsh 约 220 MB),由 pnpm 原地升级;传精确版本会每发一版就多一个
 /// 220 MB 目录,磁盘无上限增长。
 fn resolve_dsh_spec() -> String {
     if let Some(pin) = read_setting("app-dsh-channel") {
@@ -245,13 +245,13 @@ fn resolve_dsh_spec() -> String {
     }
     match newest_channel() {
         Some(tag) => format!("{}@{}", DSH_PACKAGE, tag),
-        // 解析失败(离线/私有源/网络受限)就退回裸 spec:它对应的 npx 缓存目录
+        // 解析失败(离线/私有源/网络受限)就退回裸 spec:它对应的 pnpm 缓存目录
         // 通常早就装好了,能离线秒起,而不是卡在一次注定失败的下载上
         None => DSH_PACKAGE.to_string(),
     }
 }
 
-/// 拉起 npx @deepseek-ai/dsh web
+/// 拉起 pnpm dlx @deepseek-ai/dsh web
 fn spawn_dsh(spec: &str) -> Option<Child> {
     let log = log_path();
     let log_file = match fs::OpenOptions::new()
@@ -264,16 +264,16 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
         Err(_) => return None,
     };
 
-    // -y:跳过 npx 的 "Ok to proceed?" 确认。stdin 是 null(非 TTY)时 npx 本就不问,
-    // 显式给上是防用户 .npmrc 里写了 yes=false —— 那会让启动直接失败。
+    // -y:自动确认,pnpm dlx 遇到没装过的包不弹确认。stdin 是 null(非 TTY)时本就不问,
+    // 显式给上是防用户配置里写了静默 no —— 那会让启动直接失败。
     // --no-open:桌面壳自己导航到 WebView,不让 dsh 再弹系统默认浏览器。
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd");
-        c.args(["/C", "npx", "-y", spec, "web", "--no-open"]);
+        c.args(["/C", "pnpm", "dlx", "-y", spec, "web", "--no-open"]);
         c
     } else {
         let script = format!(
-            "source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true; npx -y {} web --no-open",
+            "source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true; pnpm dlx -y {} web --no-open",
             spec
         );
         let mut c = Command::new("sh");
@@ -295,7 +295,7 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
             let _ = fs::write(
                 &log,
                 format!(
-                    "[{}] dsh 启动中: npx -y {} web, PID={}\n",
+                    "[{}] dsh 启动中: pnpm dlx -y {} web, PID={}\n",
                     chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
                     spec,
                     child.id()
@@ -645,7 +645,7 @@ code{{background:#16213e;padding:2px 6px;border-radius:3px;font-size:13px}}
 <p><strong>原因:</strong>{reason}</p>
 <p><strong>排查步骤:</strong></p>
 <p>1. 确认已安装 <a href="https://nodejs.org" style="color:#58a6ff">Node.js</a></p>
-<p>2. 在终端手动执行测试:<br><code>npx @deepseek-ai/dsh web</code></p>
+<p>2. 在终端手动执行测试:<br><code>pnpm dlx -y @deepseek-ai/dsh web</code></p>
 <p>3. 查看日志文件:<br><code>~/.dsh/.dsh-app-launcher.log</code></p>
 </div>
 </body></html>"#,
@@ -749,9 +749,9 @@ fn main() {
                     }
                     if Instant::now() > deadline {
                         let reason = if had_child {
-                            "npx 已启动但 dsh web 长时间未就绪(超过 10 分钟)。可能是下载被网络卡住,或 dsh 启动报错 —— 请看日志。"
+                            "pnpm dlx 已启动但 dsh web 长时间未就绪(超过 10 分钟)。可能是下载被网络卡住,或 dsh 启动报错 —— 请看日志。"
                         } else {
-                            "无法启动 npx 进程。请确认已安装 Node.js。"
+                            "无法启动 pnpm 进程。请确认已安装 Node.js 和 pnpm。"
                         };
                         let html = error_html(reason);
                         let _ = window.eval(&format!(
@@ -814,7 +814,7 @@ fn main() {
                     return;
                 }
                 "quit" => {
-                    // 退出前 kill 掉 npx/dsh 整个进程树
+                    // 退出前 kill 掉 pnpm/dsh 整个进程树
                     if let Some(state) = app.try_state::<DshChild>() {
                         if let Some(mut child) = state.0.lock().unwrap().take() {
                             let pid = child.id();
@@ -894,7 +894,7 @@ mod tests {
         assert_eq!(pick_newest_tag(&t).as_deref(), Some("next"));
     }
 
-    /// 版本并列时偏向 latest,避免多占一个 npx 缓存目录
+    /// 版本并列时偏向 latest,避免多占一个 pnpm 缓存目录
     #[test]
     fn breaks_ties_toward_latest() {
         let t = tags(&[("next", "0.1.0"), ("latest", "0.1.0")]);
