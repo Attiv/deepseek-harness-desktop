@@ -283,7 +283,8 @@ fn resolve_dsh_spec() -> String {
     }
 }
 
-/// 拉起 pnpm dlx @deepseek-ai/dsh web
+/// 拉起 dsh web 后端:优先 `pnpm dlx`,没有 pnpm 时回退 `npx -y`。
+/// 全程无 stdin,所以任何交互确认都必须提前在环境变量里关掉。
 fn spawn_dsh(spec: &str) -> Option<Child> {
     let log = log_path();
     let log_file = match fs::OpenOptions::new()
@@ -298,11 +299,29 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
 
     // pnpm dlx 会直接安装临时包，不需要 npx 的 `-y` 确认选项。
     // --no-open:桌面壳自己导航到 WebView,不让 dsh 再弹系统默认浏览器。
-    let mut cmd = if cfg!(target_os = "windows") {
+    //
+    // 回退到 npx 时必须带 `-y`:npx 装新包前会问 "Ok to proceed? (y)"。桌面壳的
+    // stdin 是 null,这个问题永远等不到答案 —— 表现就是升级时静默挂死到超时。
+    //
+    // 三个分支用 `#[cfg]` 而非 `cfg!` 分开:Windows 分支要调只在 Windows 存在的
+    // `raw_arg`,放进 `cfg!` 的 if-else 里会让 macOS/Linux 编译不过。
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        // 用 raw_arg 传整条命令行:Rust 会给普通 arg 加转义引号,那会让 cmd 把
+        // `&` / `(` 当成字面量而不是语法。外层引号由 cmd /C 自己剥掉。
+        //
+        // 先 `where` 探测再分支,而不是 `pnpm ... || npx ...`:后者在 pnpm 存在
+        // 但 dsh 自己崩溃时也会触发,白白拉一次 220 MB 的 npx 重装。
         let mut c = Command::new("cmd");
-        c.args(["/C", "pnpm", "dlx", spec, "web", "--no-open"]);
+        c.arg("/C").raw_arg(format!(
+            "\"where pnpm >nul 2>nul & if errorlevel 1 (npx -y {spec} web --no-open) else (pnpm dlx {spec} web --no-open)\"",
+            spec = spec
+        ));
         c
-    } else if cfg!(target_os = "macos") {
+    };
+
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
         // macOS: 用户的 pnpm 通常在 zsh 的 PATH 里(sh 读不进 .zshrc 的 zsh 语法,
         // 也带不出 nvm/volta 这些)。桌面 shell 不能凭空假设 PATH,所以用 zsh 加载
         // 用户的完整环境来执行,并兜底补常见 pnpm 安装位置。
@@ -311,11 +330,16 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
   pnpm dlx {spec} web --no-open
   exit $?
 fi
-# pnpm 不在当前 PATH —— zsh + 常用安装路径都补一版,再找不到才报错
+# pnpm 不在当前 PATH —— zsh + 常用安装路径都补一版,再找不到才退 npx
 for d in "$HOME/.local/share/pnpm" "$HOME/.tesh" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
   [ -n "$d" ] && [ -x "$d/pnpm" ] && exec "$d/pnpm" dlx {spec} web --no-open
 done
-echo "ERROR: pnpm not found. Install it: npm i -g pnpm or https://pnpm.io/installation" >&2
+# 没有 pnpm 就用 Node 自带的 npx。`-y` 必须带:否则它会问 "Ok to proceed? (y)",
+# 而桌面壳没有 stdin 可答,升级时就会一直挂着。
+if command -v npx >/dev/null 2>&1; then
+  exec npx -y {spec} web --no-open
+fi
+echo "ERROR: neither pnpm nor npx found. Install Node.js (https://nodejs.org) or pnpm (https://pnpm.io/installation)" >&2
 exit 127"#,
             spec = spec
         );
@@ -330,7 +354,10 @@ exit 127"#,
             c.args(["-c", script.as_str()]);
             c
         }
-    } else {
+    };
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut cmd = {
         // Linux: 用户的 pnpm 常在 .bashrc/.profile,这里 source 后再跑
         let script = format!(
             r#"[ -f "$HOME/.profile" ] && . "$HOME/.profile" 2>/dev/null || true
@@ -342,7 +369,12 @@ fi
 for d in "$HOME/.local/share/pnpm" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
   [ -n "$d" ] && [ -x "$d/pnpm" ] && exec "$d/pnpm" dlx {spec} web --no-open
 done
-echo "ERROR: pnpm not found. Install it: npm i -g pnpm or https://pnpm.io/installation" >&2
+# 没有 pnpm 就用 Node 自带的 npx。`-y` 必须带:否则它会问 "Ok to proceed? (y)",
+# 而桌面壳没有 stdin 可答,升级时就会一直挂着。
+if command -v npx >/dev/null 2>&1; then
+  exec npx -y {spec} web --no-open
+fi
+echo "ERROR: neither pnpm nor npx found. Install Node.js (https://nodejs.org) or pnpm (https://pnpm.io/installation)" >&2
 exit 127"#,
             spec = spec
         );
@@ -350,6 +382,23 @@ exit 127"#,
         c.args(["-c", script.as_str()]);
         c
     };
+
+    // 后端没有 stdin,任何交互提问都等不到答案 —— 表现是「升级时静默卡死到超时」,
+    // 而不是报错。所以在环境层面把包管理器的确认全部预先关掉:
+    //
+    // COREPACK_ENABLE_DOWNLOAD_PROMPT:Node 自带的 corepack 在需要下载新版
+    //   pnpm/npm 时会问 "Do you want to continue? [Y/n]" 并阻塞等输入。这正是
+    //   「平时能用、一到升级就卡住」的元凶,Windows 上尤其常见(pnpm 多由
+    //   corepack 托管)。置 0 即直接下载。
+    // npm_config_yes:npx 的 `-y` 的环境变量形式,连带覆盖 dsh 内部可能再调起的
+    //   npx,不只是我们自己拼的那条命令行。
+    // NO_UPDATE_NOTIFIER:掉 update-notifier 的横幅,顺带少一处想画交互 UI 的地方。
+    //
+    // 故意不设 CI=1:它会被整个 dsh 后端及其中 agent 执行的每条命令继承,
+    // 会改掉一堆无关工具的行为(比如让 pnpm install 默认 --frozen-lockfile)。
+    cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+        .env("npm_config_yes", "true")
+        .env("NO_UPDATE_NOTIFIER", "1");
 
     cmd.stdin(Stdio::null())
         .stdout(std::process::Stdio::from(log_file.try_clone().unwrap()))
@@ -370,7 +419,7 @@ exit 127"#,
             let _ = fs::write(
                 &log,
                 format!(
-                    "[{}] dsh 启动中: pnpm dlx {} web --no-open, PID={}\n",
+                    "[{}] dsh 启动中: {} web --no-open (pnpm dlx,缺 pnpm 时回退 npx -y), PID={}\n",
                     chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
                     spec,
                     child.id()
@@ -939,9 +988,9 @@ fn main() {
                     }
                     if Instant::now() > deadline {
                         let reason = if had_child {
-                            "pnpm dlx 已启动但 dsh web 长时间未就绪(超过 10 分钟)。可能是下载被网络卡住,或 dsh 启动报错 —— 请看日志。"
+                            "启动器已拉起但 dsh web 长时间未就绪(超过 10 分钟)。可能是下载被网络卡住,或 dsh 启动报错 —— 请看日志。"
                         } else {
-                            "无法启动 pnpm 进程。请确认已安装 Node.js 和 pnpm。"
+                            "无法启动包管理器进程。请确认已安装 Node.js(pnpm 可选)。"
                         };
                         let html = error_html(reason);
                         let _ = window.eval(&format!(

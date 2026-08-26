@@ -5,6 +5,9 @@
 # --- Node 依赖 ---
 node_modules/
 
+# --- Python 测试缓存 ---
+__pycache__/
+
 # --- 编译输出 / 打包产物 ---
 /release/
 *.exe
