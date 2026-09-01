@@ -159,19 +159,93 @@ const PROFILE_FILES: &[&str] = &[
     "pnpm-workspace.yaml",
 ];
 
-/// 检查 dsh web 是否已在跑
-fn dsh_running() -> bool {
+/// dsh web 的就绪状态。
+///
+/// 新版 dsh(0.1.2-alpha.3 起)在未认证时回 401 —— 那说明 HTTP 服务其实已经起来了,
+/// 只是还缺 launch token,和「端口上没人听」是两回事,必须分开。旧版没有认证,
+/// 裸地址直接回 200。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DshState {
+    /// 端口没有响应。
+    Down,
+    /// 服务在跑,但要先用 launch token 换 cookie 才放行。
+    NeedsAuth,
+    /// 服务在跑,且这次请求已被放行(旧版无认证)。
+    Ready,
+}
+
+/// 探测 dsh web 的状态。5xx 与连不上一样按未就绪处理。
+fn probe_dsh() -> DshState {
     let url = format!("http://127.0.0.1:{}", DSH_PORT);
-    match reqwest::blocking::Client::builder()
+    let Ok(client) = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
-    {
-        Ok(c) => match c.get(&url).send() {
-            Ok(r) => r.status().as_u16() < 500,
-            Err(_) => false,
-        },
-        Err(_) => false,
+    else {
+        return DshState::Down;
+    };
+    match client.get(&url).send() {
+        Ok(r) if r.status().as_u16() == 401 => DshState::NeedsAuth,
+        Ok(r) if r.status().as_u16() < 500 => DshState::Ready,
+        _ => DshState::Down,
     }
+}
+
+/// launch token 的字符集:上游把 32 字节随机数做 base64url 编码。
+fn is_launch_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
+}
+
+/// 从启动日志里取本次 dsh 进程打印的 launch token。
+///
+/// 新版 dsh web 启动时会打印一行:
+///   `dsh web: http://127.0.0.1:3080/?token=<base64url>`
+/// 有 LAN 地址时后面还跟 ` (LAN: http://<ip>:3080/?token=<同一个 token>)` ——
+/// 两处 token 相同,取第一个即可。
+///
+/// 旧版(0.1.1-rc.2 及更早)没有认证,打印的 URL 不带 token:这里返回 None,
+/// 调用方退回裸地址,保持对 pin 在旧频道的用户的兼容。
+fn parse_launch_token(log: &str) -> Option<String> {
+    for line in log.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("dsh web: ") else {
+            continue;
+        };
+        let Some((_, after)) = rest.split_once("?token=") else {
+            continue;
+        };
+        let token: String = after
+            .chars()
+            .take_while(|c| is_launch_token_char(*c))
+            .collect();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    None
+}
+
+fn read_launch_token() -> Option<String> {
+    parse_launch_token(&fs::read_to_string(log_path()).ok()?)
+}
+
+/// 拿 token 试兑换一次 cookie,只为判断它还有没有效。
+///
+/// 有效时上游回 303(跳回干净的 `/`),失效回 401 —— 所以必须关掉自动重定向,
+/// 否则 303 会被 reqwest 跟掉,判据就没了。这里换到的 cookie 对 WebView 没用,
+/// 真正的换发要由 WebView 自己走一遍带 token 的导航;token 是常量时间比较、
+/// 可重复兑换,多验这一次没有副作用。
+///
+/// 唯一目的是把「日志里的 token 属于已经退出的进程」和「token 有效」分开:
+/// 前者说明 3080 上是外部启动的实例,再等下去也等不到我们能用的 token。
+fn token_accepted(token: &str) -> bool {
+    let url = format!("{}/?token={}", DSH_URL, token);
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()
+        .and_then(|c| c.get(&url).send().ok())
+        .map(|r| r.status().is_redirection())
+        .unwrap_or(false)
 }
 
 /// spec 片段(dist-tag 名或版本号)是否只含安全字符。
@@ -847,11 +921,32 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
     Ok(format!("已导入 {} 个配置文件。\n重启 DSH 后生效。", extracted))
 }
 
-/// 超时错误 HTML
-fn error_html(reason: &str) -> String {
+/// 启动失败页的排查步骤。
+const BOOT_ERROR_STEPS: &[&str] = &[
+    r#"确认已安装 <a href="https://nodejs.org" style="color:#58a6ff">Node.js</a>"#,
+    r#"在终端手动执行测试:<br><code>pnpm dlx @deepseek-ai/dsh web</code>"#,
+    r#"查看日志文件:<br><code>~/.dsh/.dsh-app-launcher.log</code>"#,
+];
+
+/// 认证失败页的排查步骤。launch token 每进程随机、只在 dsh 自己的 stdout 打印,
+/// 外部启动的实例我们读不到 —— 只能让用户二选一。
+const AUTH_ERROR_STEPS: &[&str] = &[
+    r#"关闭终端里那个 dsh 实例,然后重新打开本应用"#,
+    r#"或在终端里找到它打印的 <code>dsh web: http://127.0.0.1:3080/?token=…</code> 那行,用浏览器打开"#,
+    r#"查看日志文件:<br><code>~/.dsh/.dsh-app-launcher.log</code>"#,
+];
+
+/// 错误页 HTML。`steps` 内含标记,和 `reason` 一样直接插值 —— 两者都是本文件的常量。
+fn error_html(title: &str, reason: &str, steps: &[&str]) -> String {
+    let steps_html = steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| format!("<p>{}. {}</p>", i + 1, step))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         r#"<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>启动失败</title>
+<html><head><meta charset="utf-8"><title>{title}</title>
 <style>
 html,body{{margin:0;height:100%;background:#1a1a2e;color:#e0e0e0;
 font-family:-apple-system,"Segoe UI",system-ui,sans-serif;display:flex;
@@ -863,15 +958,36 @@ code{{background:#16213e;padding:2px 6px;border-radius:3px;font-size:13px}}
 </style></head>
 <body>
 <div class="box">
-<h1>⚠️ DSH 启动失败</h1>
+<h1>⚠️ {title}</h1>
 <p><strong>原因:</strong>{reason}</p>
 <p><strong>排查步骤:</strong></p>
-<p>1. 确认已安装 <a href="https://nodejs.org" style="color:#58a6ff">Node.js</a></p>
-<p>2. 在终端手动执行测试:<br><code>pnpm dlx @deepseek-ai/dsh web</code></p>
-<p>3. 查看日志文件:<br><code>~/.dsh/.dsh-app-launcher.log</code></p>
+{steps_html}
 </div>
 </body></html>"#,
-        reason = reason
+        title = title,
+        reason = reason,
+        steps_html = steps_html
+    )
+}
+
+/// 赌 WebView cookie 失败时的兜底脚本。
+///
+/// 赌赢了页面就是 dsh 的 GUI,这段脚本什么都不做;赌输了页面是 dsh 回的 401
+/// 纯文本(`text/plain`,body 里就那一句英文),就地换成中文指引。
+///
+/// 之所以由页面自己判断,是因为 `window.eval` 拿不到返回值 —— 与其为这一个判断
+/// 铺一条 IPC 回程,不如把判断和替换一起交给页面。
+fn auth_fallback_script() -> String {
+    let html = error_html(
+        "DSH 需要认证",
+        "3080 端口上的 dsh web 不是本应用启动的,拿不到它那份一次性认证 token;浏览器里也没有仍然有效的登录状态。",
+        AUTH_ERROR_STEPS,
+    );
+    format!(
+        "var t = (document.body ? (document.body.innerText || document.body.textContent || '') : '').trim(); \
+         if (t.startsWith({needle})) {{ document.documentElement.innerHTML = {html}; }}",
+        needle = serde_json::json!("dsh web authentication required"),
+        html = serde_json::json!(html)
     )
 }
 
@@ -948,11 +1064,11 @@ fn main() {
             .visible(false)
             .build()?;
 
-            let child = if dsh_running() {
-                None
-            } else {
+            let child = if probe_dsh() == DshState::Down {
                 // 只有真要拉起后端时才去解析版本,复用已在跑的实例不付这次网络开销
                 spawn_dsh(&resolve_dsh_spec())
+            } else {
+                None
             };
             let had_child = child.is_some();
 
@@ -986,13 +1102,61 @@ fn main() {
                         let _ = window.show();
                         revealed = true;
                     }
+
+                    let state = probe_dsh();
+
+                    // 新版 dsh 要先用 launch token 换 cookie。token 每进程随机、只在 stdout
+                    // 打印,所以只能从我们自己重定向过去的那份日志里捞。
+                    let token = if state == DshState::NeedsAuth {
+                        read_launch_token().filter(|t| token_accepted(t))
+                    } else {
+                        None
+                    };
+
+                    // 拿不到有效 token 时还剩最后一条路:WebView 里可能留着上次换到的
+                    // cookie。它的签名 secret 持久化在 ~/.dsh/.credentials.yaml,跨进程
+                    // 有效(默认 30 天),所以外部实例照样认。探测用的 reqwest 不带 cookie,
+                    // 这条路通不通在这里看不出来 —— 只能让 WebView 自己去试一把。
+                    //
+                    // 什么时候才值得试:复用的是外部实例(它的 token 永远不会进我们的日志,
+                    // 再等也没有意义),或者已经等到超时。自己拉起的后端还在启动途中时不试,
+                    // 它马上就会把 token 打印出来。
+                    let bet_on_cookie = state == DshState::NeedsAuth
+                        && token.is_none()
+                        && (!had_child || Instant::now() > deadline);
+
+                    let target = match (state, &token) {
+                        // 旧版无认证,或这次请求已被放行
+                        (DshState::Ready, _) => Some(DSH_URL.to_string()),
+                        // 路径必须落在 `/`:上游只在 pathname 为 "/" 时兑换 token
+                        (DshState::NeedsAuth, Some(t)) => {
+                            Some(format!("{}/?token={}", DSH_URL, t))
+                        }
+                        _ if bet_on_cookie => Some(DSH_URL.to_string()),
+                        _ => None,
+                    };
+
+                    if let Some(target) = target {
+                        let _ = window.navigate(target.parse().unwrap_or_else(|_| {
+                            format!("http://127.0.0.1:{}", DSH_PORT).parse().unwrap()
+                        }));
+                        std::thread::sleep(Duration::from_millis(500));
+                        // 赌输了页面上就是 dsh 的英文 401,换成中文指引
+                        if bet_on_cookie {
+                            let _ = window.eval(&auth_fallback_script());
+                        }
+                        let _ = window.show();
+                        break;
+                    }
+
+                    // 走到这里说明端口还没起来。超时了就只剩报错。
                     if Instant::now() > deadline {
                         let reason = if had_child {
                             "启动器已拉起但 dsh web 长时间未就绪(超过 10 分钟)。可能是下载被网络卡住,或 dsh 启动报错 —— 请看日志。"
                         } else {
                             "无法启动包管理器进程。请确认已安装 Node.js(pnpm 可选)。"
                         };
-                        let html = error_html(reason);
+                        let html = error_html("DSH 启动失败", reason, BOOT_ERROR_STEPS);
                         let _ = window.eval(&format!(
                             "document.documentElement.innerHTML = {};",
                             serde_json::json!(html)
@@ -1000,20 +1164,7 @@ fn main() {
                         let _ = window.show();
                         break;
                     }
-                    if dsh_running() {
-                        let _ = window.navigate(
-                            DSH_URL
-                                .parse()
-                                .unwrap_or_else(|_| {
-                                    format!("http://127.0.0.1:{}", DSH_PORT)
-                                        .parse()
-                                        .unwrap()
-                                }),
-                        );
-                        std::thread::sleep(Duration::from_millis(500));
-                        let _ = window.show();
-                        break;
-                    }
+
                     std::thread::sleep(Duration::from_millis(700));
                 }
             });
@@ -1302,6 +1453,41 @@ mod tests {
         assert!(!is_safe_spec_token("x&calc"));
         assert!(!is_safe_spec_token("$(id)"));
         assert!(!is_safe_spec_token("a|b"));
+    }
+
+    /// 新版 dsh 的 launch token 只在这一行出现,前面还夹着插件的启动输出。
+    #[test]
+    fn parses_launch_token_from_startup_log() {
+        let log = "dsh-client-masquerade ready: llm-pi-ai spoof controller active\n\
+                   dsh web: http://127.0.0.1:3080/?token=1eBHG70HVPH97-9ahDKgxw1jC1u8BXScDr6tGVjh0ig\n";
+        assert_eq!(
+            parse_launch_token(log).as_deref(),
+            Some("1eBHG70HVPH97-9ahDKgxw1jC1u8BXScDr6tGVjh0ig")
+        );
+    }
+
+    /// 带 LAN 地址时同一行会出现两个 token(值相同),取第一个即可。
+    #[test]
+    fn parses_launch_token_ignoring_lan_suffix() {
+        let log = "dsh web: http://127.0.0.1:3080/?token=abc_DEF-123 (LAN: http://192.168.1.5:3080/?token=abc_DEF-123)";
+        assert_eq!(parse_launch_token(log).as_deref(), Some("abc_DEF-123"));
+    }
+
+    /// token 后面紧跟的非 base64url 字符是 URL 语法,不能被吞进 token。
+    #[test]
+    fn parses_launch_token_stopping_at_non_base64url() {
+        let log = "dsh web: http://127.0.0.1:3080/?token=abc123&other=x";
+        assert_eq!(parse_launch_token(log).as_deref(), Some("abc123"));
+    }
+
+    /// 旧版(0.1.1-rc.2 及更早)没有认证,打印的 URL 不带 token —— 调用方要退回裸地址。
+    #[test]
+    fn parses_no_launch_token_from_legacy_or_empty_log() {
+        assert!(parse_launch_token("dsh web: http://127.0.0.1:3080").is_none());
+        assert!(parse_launch_token("").is_none());
+        assert!(parse_launch_token("dsh web: opening the default browser").is_none());
+        // 有前缀但 token 为空,同样不能当成有效 token 拿去导航
+        assert!(parse_launch_token("dsh web: http://127.0.0.1:3080/?token=").is_none());
     }
 
     /// 打通真实 registry 的解析链路。会联网,默认不跑:
