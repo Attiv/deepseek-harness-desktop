@@ -174,7 +174,16 @@ enum DshState {
     Ready,
 }
 
-/// 探测 dsh web 的状态。5xx 与连不上一样按未就绪处理。
+fn dsh_state_for_status(status: u16) -> DshState {
+    match status {
+        401 => DshState::NeedsAuth,
+        200..=399 => DshState::Ready,
+        _ => DshState::Down,
+    }
+}
+
+/// 探测 dsh web 的状态。dsh 启动中会短暂返回 404，因此只有 2xx/3xx
+/// 才能表示旧版服务已就绪；其余响应与连不上一样继续等待。
 fn probe_dsh() -> DshState {
     let url = format!("http://127.0.0.1:{}", DSH_PORT);
     let Ok(client) = reqwest::blocking::Client::builder()
@@ -183,11 +192,11 @@ fn probe_dsh() -> DshState {
     else {
         return DshState::Down;
     };
-    match client.get(&url).send() {
-        Ok(r) if r.status().as_u16() == 401 => DshState::NeedsAuth,
-        Ok(r) if r.status().as_u16() < 500 => DshState::Ready,
-        _ => DshState::Down,
-    }
+    client
+        .get(&url)
+        .send()
+        .map(|response| dsh_state_for_status(response.status().as_u16()))
+        .unwrap_or(DshState::Down)
 }
 
 /// launch token 的字符集:上游把 32 字节随机数做 base64url 编码。
@@ -227,25 +236,46 @@ fn read_launch_token() -> Option<String> {
     parse_launch_token(&fs::read_to_string(log_path()).ok()?)
 }
 
-/// 拿 token 试兑换一次 cookie,只为判断它还有没有效。
+/// 把 dsh 返回的 Set-Cookie 准备成能直接注入 WebView 的 cookie。
+///
+/// HTTP 响应里的 host-only cookie 没有 Domain 属性；Wry 的跨平台 set_cookie API
+/// 需要显式 origin，因此补上和 DSH_URL 一致的 loopback host。
+fn webview_auth_cookie(raw: &str) -> Option<tauri::webview::Cookie<'static>> {
+    let mut cookie = tauri::webview::Cookie::parse(raw.to_string()).ok()?;
+    cookie.set_domain("127.0.0.1");
+    // Strict 会把从 tauri:// 发起的第一次顶层导航也判成跨站并压住 cookie；
+    // Lax 允许安全的顶层 GET，同时仍不会把 cookie 发给跨站子资源或 POST。
+    cookie.set_same_site(cookie::SameSite::Lax);
+    Some(cookie)
+}
+
+/// 拿 token 兑换认证 cookie；返回 None 说明 token 已失效或响应格式不对。
 ///
 /// 有效时上游回 303(跳回干净的 `/`),失效回 401 —— 所以必须关掉自动重定向,
-/// 否则 303 会被 reqwest 跟掉,判据就没了。这里换到的 cookie 对 WebView 没用,
-/// 真正的换发要由 WebView 自己走一遍带 token 的导航;token 是常量时间比较、
-/// 可重复兑换,多验这一次没有副作用。
+/// 否则 303 会被 reqwest 跟掉,判据就没了。reqwest 与 WebView 不共享 cookie store,
+/// 所以要取出 Set-Cookie 并显式注入 WebView。不能只让 WebView 自己走 303:
+/// macOS WKWebView 从 tauri:// 页面跨站导航时会保存 SameSite=Strict cookie,
+/// 却不会在紧随其后的重定向请求里发送它,最终仍落到 401。
 ///
 /// 唯一目的是把「日志里的 token 属于已经退出的进程」和「token 有效」分开:
 /// 前者说明 3080 上是外部启动的实例,再等下去也等不到我们能用的 token。
-fn token_accepted(token: &str) -> bool {
+fn redeem_launch_token(token: &str) -> Option<tauri::webview::Cookie<'static>> {
     let url = format!("{}/?token={}", DSH_URL, token);
-    reqwest::blocking::Client::builder()
+    let response = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()
-        .and_then(|c| c.get(&url).send().ok())
-        .map(|r| r.status().is_redirection())
-        .unwrap_or(false)
+        .and_then(|c| c.get(&url).send().ok())?;
+    if !response.status().is_redirection() {
+        return None;
+    }
+    let raw = response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)?
+        .to_str()
+        .ok()?;
+    webview_auth_cookie(raw)
 }
 
 /// spec 片段(dist-tag 名或版本号)是否只含安全字符。
@@ -1107,8 +1137,10 @@ fn main() {
 
                     // 新版 dsh 要先用 launch token 换 cookie。token 每进程随机、只在 stdout
                     // 打印,所以只能从我们自己重定向过去的那份日志里捞。
-                    let token = if state == DshState::NeedsAuth {
-                        read_launch_token().filter(|t| token_accepted(t))
+                    let auth = if state == DshState::NeedsAuth {
+                        read_launch_token().and_then(|token| {
+                            redeem_launch_token(&token).map(|cookie| (token, cookie))
+                        })
                     } else {
                         None
                     };
@@ -1122,15 +1154,21 @@ fn main() {
                     // 再等也没有意义),或者已经等到超时。自己拉起的后端还在启动途中时不试,
                     // 它马上就会把 token 打印出来。
                     let bet_on_cookie = state == DshState::NeedsAuth
-                        && token.is_none()
+                        && auth.is_none()
                         && (!had_child || Instant::now() > deadline);
 
-                    let target = match (state, &token) {
+                    let target = match (state, &auth) {
                         // 旧版无认证,或这次请求已被放行
                         (DshState::Ready, _) => Some(DSH_URL.to_string()),
-                        // 路径必须落在 `/`:上游只在 pathname 为 "/" 时兑换 token
-                        (DshState::NeedsAuth, Some(t)) => {
-                            Some(format!("{}/?token={}", DSH_URL, t))
+                        // reqwest 已用 token 换到 cookie。先注入 WebView 再打开裸地址,
+                        // 避免 WKWebView 在跨站 303 中压住 SameSite=Strict cookie。
+                        (DshState::NeedsAuth, Some((token, cookie))) => {
+                            if window.set_cookie(cookie.clone()).is_ok() {
+                                Some(DSH_URL.to_string())
+                            } else {
+                                // 旧版 Wry/平台不支持注入时保留原生 token 导航兜底。
+                                Some(format!("{}/?token={}", DSH_URL, token))
+                            }
                         }
                         _ if bet_on_cookie => Some(DSH_URL.to_string()),
                         _ => None,
@@ -1240,6 +1278,33 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dsh 在监听端口后、BrowserAuth 激活前会短暂返回 404。这个中间态不能
+    /// 被当成就绪，否则 WebView 会过早打开裸地址，随后正好撞上认证 401。
+    #[test]
+    fn transient_not_found_during_startup_is_not_ready() {
+        assert_eq!(dsh_state_for_status(404), DshState::Down);
+    }
+
+    /// WKWebView 从 tauri:// 页面跳到 dsh 时不会在 token 兑换后的 303 跳转中
+    /// 回送 SameSite=Strict cookie，因此启动器要把兑换响应里的 cookie 注入 WebView。
+    #[test]
+    fn prepares_redeemed_auth_cookie_for_the_webview_origin() {
+        let raw = "dsh-auth-example=v1.payload.signature; Max-Age=2592000; Path=/; \
+                   Expires=Sun, 04 Oct 2026 01:46:57 GMT; HttpOnly; SameSite=Strict";
+
+        let cookie = webview_auth_cookie(raw).expect("parse dsh auth cookie");
+
+        assert_eq!(cookie.name(), "dsh-auth-example");
+        assert_eq!(cookie.value(), "v1.payload.signature");
+        assert_eq!(cookie.domain(), Some("127.0.0.1"));
+        assert_eq!(cookie.path(), Some("/"));
+        assert_eq!(cookie.http_only(), Some(true));
+        assert_eq!(
+            cookie.same_site().map(|site| format!("{site:?}")),
+            Some("Lax".into())
+        );
+    }
 
     #[test]
     fn taking_an_absent_owned_child_returns_none() {
