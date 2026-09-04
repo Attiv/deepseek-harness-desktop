@@ -98,6 +98,8 @@ class LauncherCommandTests(unittest.TestCase):
 
     def test_menu_exposes_all_plugin_update(self):
         self.assertIn('with_id("update-plugins", "一键更新全部插件")', self.source)
+        self.assertIn('"version",', self.source)
+        self.assertIn('env!("CARGO_PKG_VERSION")', self.source)
         self.assertRegex(
             self.source,
             r'"update-plugins"\s*=>\s*update_web_profile_plugins\s*\(\s*app\s*\)',
@@ -113,6 +115,8 @@ class LauncherCommandTests(unittest.TestCase):
                 re.DOTALL,
             ),
         )
+        self.assertIn('"正在更新 web profile 的全部插件...', self.source)
+        self.assertIn("dsh-app-status-pulse", self.source)
 
     def test_final_tauri_exit_stops_the_owned_backend(self):
         run_callbacks = list(

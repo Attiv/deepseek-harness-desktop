@@ -68,6 +68,7 @@ jobs:
           echo "Version: $VERSION"
           sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
           sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" package.json
+          sed -i.bak "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
           cat src-tauri/tauri.conf.json | grep version
 
       - name: Install Linux dependencies

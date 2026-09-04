@@ -554,10 +554,40 @@ fn plugin_update_log_path() -> PathBuf {
     dsh_home().join(".dsh-plugin-update.log")
 }
 
-fn notify_plugin_update(app: &tauri::AppHandle, message: &str) {
+fn show_status(app: &tauri::AppHandle, message: &str, state: &str) {
     if let Some(window) = app.get_webview_window("main") {
-        let script = format!("alert({});", serde_json::to_string(message).unwrap());
-        let _ = window.eval(&script);
+        let message_json = serde_json::to_string(message).unwrap();
+        let state_json = serde_json::to_string(state).unwrap();
+        let script = format!(
+            r#"(() => {{
+                const id = 'dsh-app-status';
+                let node = document.getElementById(id);
+                if (!node) {{
+                    node = document.createElement('div');
+                    node.id = id;
+                    node.style.cssText = 'position:fixed;top:16px;right:16px;z-index:2147483647;max-width:460px;padding:12px 16px;border-radius:8px;font:14px/1.45 system-ui,sans-serif;white-space:pre-wrap;box-shadow:0 4px 18px rgba(0,0,0,.18);transition:opacity .2s ease';
+                    document.body.appendChild(node);
+                }}
+                node.textContent = {message};
+                node.dataset.state = {state};
+                node.style.background = {state} === 'running' ? '#24415f' : ({state} === 'success' ? '#216e4e' : ({state} === 'info' ? '#425466' : '#8b3030'));
+                node.style.color = '#fff';
+                node.style.opacity = '1';
+                node.style.animation = {state} === 'running' ? 'dsh-app-status-pulse 1.2s ease-in-out infinite' : 'none';
+                if (!document.getElementById('dsh-app-status-style')) {{
+                    const style = document.createElement('style');
+                    style.id = 'dsh-app-status-style';
+                    style.textContent = '@keyframes dsh-app-status-pulse {{ 0%,100% {{ opacity:.72 }} 50% {{ opacity:1 }} }}';
+                    document.head.appendChild(style);
+                }}
+            }})();"#,
+            message = message_json,
+            state = state_json,
+        );
+        if window.eval(&script).is_err() {
+            let fallback = format!("alert({});", message_json);
+            let _ = window.eval(&fallback);
+        }
     }
 }
 
@@ -568,14 +598,16 @@ fn update_web_profile_plugins(app: &tauri::AppHandle) {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        notify_plugin_update(app, "插件更新已经在进行中，请等待完成。");
+        show_status(app, "插件更新已经在进行中，请等待完成。", "error");
         return;
     }
+
+    show_status(app, "正在更新 web profile 的全部插件...\n请保持应用开启。", "running");
 
     let profile = dsh_home().join("profiles").join("web");
     if !profile.is_dir() {
         PLUGIN_UPDATE_RUNNING.store(false, Ordering::Release);
-        notify_plugin_update(app, "未找到 web profile，无法更新插件。请先启动一次 DSH。");
+        show_status(app, "未找到 web profile，无法更新插件。请先启动一次 DSH。", "error");
         return;
     }
 
@@ -589,7 +621,7 @@ fn update_web_profile_plugins(app: &tauri::AppHandle) {
         Ok(file) => file,
         Err(error) => {
             PLUGIN_UPDATE_RUNNING.store(false, Ordering::Release);
-            notify_plugin_update(app, &format!("无法创建插件更新日志: {error}"));
+            show_status(app, &format!("无法创建插件更新日志: {error}"), "error");
             return;
         }
     };
@@ -607,9 +639,10 @@ fn update_web_profile_plugins(app: &tauri::AppHandle) {
         Ok(child) => child,
         Err(error) => {
             PLUGIN_UPDATE_RUNNING.store(false, Ordering::Release);
-            notify_plugin_update(
+            show_status(
                 app,
                 &format!("启动插件更新失败: {error}\n日志: {}", log_path.display()),
+                "error",
             );
             return;
         }
@@ -619,25 +652,34 @@ fn update_web_profile_plugins(app: &tauri::AppHandle) {
     std::thread::spawn(move || {
         let result = child.wait();
         PLUGIN_UPDATE_RUNNING.store(false, Ordering::Release);
-        let message = match result {
-            Ok(status) if status.success() => format!(
-                "插件已全部更新完成。\n请完全退出并重新启动 DSH 后生效。\n日志: {}",
-                log_path.display()
+        let (message, state) = match result {
+            Ok(status) if status.success() => (
+                format!(
+                    "插件已全部更新完成。\n请完全退出并重新启动 DSH 后生效。\n日志: {}",
+                    log_path.display()
+                ),
+                "success",
             ),
-            Ok(status) => format!(
-                "插件更新失败 (退出码: {})。现有插件未被主动删除。\n日志: {}",
-                status
-                    .code()
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "未知".to_string()),
-                log_path.display()
+            Ok(status) => (
+                format!(
+                    "插件更新失败 (退出码: {})。现有插件未被主动删除。\n日志: {}",
+                    status
+                        .code()
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "未知".to_string()),
+                    log_path.display()
+                ),
+                "error",
             ),
-            Err(error) => format!(
-                "等待插件更新进程失败: {error}\n日志: {}",
-                log_path.display()
+            Err(error) => (
+                format!(
+                    "等待插件更新进程失败: {error}\n日志: {}",
+                    log_path.display()
+                ),
+                "error",
             ),
         };
-        notify_plugin_update(&app, &message);
+        show_status(&app, &message, state);
     });
 }
 
@@ -911,6 +953,11 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .build(app).map_err(|e| e.to_string())?;
     let update_plugins_item = MenuItemBuilder::with_id("update-plugins", "一键更新全部插件")
         .build(app).map_err(|e| e.to_string())?;
+    let version_item = MenuItemBuilder::with_id(
+        "version",
+        format!("版本信息 v{}", env!("CARGO_PKG_VERSION")),
+    )
+        .build(app).map_err(|e| e.to_string())?;
     let quit_item = MenuItemBuilder::with_id("quit", "退出 DeepSeek Harness")
         .accelerator("CmdOrCtrl+Q")
         .build(app).map_err(|e| e.to_string())?;
@@ -925,6 +972,7 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .item(&import_item)
         .item(&update_plugins_item)
         .separator()
+        .item(&version_item)
         .item(&quit_item)
         .build().map_err(|e| e.to_string())?;
 
@@ -1464,6 +1512,18 @@ fn main() {
                 "export-cred" => do_export(app, true),
                 "import" => do_import(app),
                 "update-plugins" => update_web_profile_plugins(app),
+                "version" => {
+                    let channel = read_setting("app-dsh-channel").unwrap_or_else(|| "latest".into());
+                    show_status(
+                        app,
+                        &format!(
+                            "DeepSeek Harness Desktop v{}\nDSH channel: {}",
+                            env!("CARGO_PKG_VERSION"),
+                            channel
+                        ),
+                        "info",
+                    );
+                }
                 _ => {}
             }
         })
