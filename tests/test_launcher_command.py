@@ -96,6 +96,24 @@ class LauncherCommandTests(unittest.TestCase):
             r"\bstop_owned_dsh\s*\(\s*app\s*\)\s*;",
         )
 
+    def test_menu_exposes_all_plugin_update(self):
+        self.assertIn('with_id("update-plugins", "一键更新全部插件")', self.source)
+        self.assertRegex(
+            self.source,
+            r'"update-plugins"\s*=>\s*update_web_profile_plugins\s*\(\s*app\s*\)',
+        )
+
+    def test_plugin_update_is_non_interactive_and_updates_the_profile(self):
+        self.assertIn("pnpm update", self.source)
+        self.assertIn("npx -y pnpm update", self.source)
+        self.assertRegex(
+            self.source,
+            re.compile(
+                r'COREPACK_ENABLE_DOWNLOAD_PROMPT.*?npm_config_yes.*?NO_UPDATE_NOTIFIER',
+                re.DOTALL,
+            ),
+        )
+
     def test_final_tauri_exit_stops_the_owned_backend(self):
         run_callbacks = list(
             re.finditer(

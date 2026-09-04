@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -36,6 +37,7 @@ const RESOLVE_TIMEOUT_SECS: u64 = 5;
 const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(400);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(400);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+static PLUGIN_UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -367,19 +369,26 @@ fn pick_newest_tag(tags: &serde_json::Map<String, serde_json::Value>) -> Option<
 
 /// 决定这次启动喂给 pnpm 的 spec。
 ///
-/// 默认自动选最新频道,用户无需确认任何东西。可在 ~/.dsh/settings.yaml 覆盖:
-/// `app-dsh-channel: newest`(默认)| `latest` | `next` | 精确版本如 `0.1.0-rc.7`。
+/// 默认使用官方稳定频道,避免预览版 dsh 与第三方 profile 插件不同步。
+/// 可在 ~/.dsh/settings.yaml 覆盖: `app-dsh-channel: newest` | `latest`(默认) |
+/// `next` | 精确版本如 `0.1.0-rc.7`。
 ///
 /// 为什么传 tag 而不是精确版本:pnpm 的缓存目录按 spec 哈希。传 tag 时所有版本
 /// 共用一个目录(dsh 约 220 MB),由 pnpm 原地升级;传精确版本会每发一版就多一个
 /// 220 MB 目录,磁盘无上限增长。
 fn resolve_dsh_spec() -> String {
-    if let Some(pin) = read_setting("app-dsh-channel") {
-        if pin != "newest" && is_safe_spec_token(&pin) {
+    let configured_channel = read_setting("app-dsh-channel");
+    if let Some(pin) = configured_channel.as_deref() {
+        if pin != "newest" && is_safe_spec_token(pin) {
             return format!("{}@{}", DSH_PACKAGE, pin);
         }
     }
-    match newest_channel() {
+    let channel = if configured_channel.as_deref() == Some("newest") {
+        newest_channel()
+    } else {
+        Some("latest".to_string())
+    };
+    match channel {
         Some(tag) => format!("{}@{}", DSH_PACKAGE, tag),
         // 解析失败(离线/私有源/网络受限)就退回裸 spec:它对应的 pnpm 缓存目录
         // 通常早就装好了,能离线秒起,而不是卡在一次注定失败的下载上
@@ -541,6 +550,136 @@ exit 127"#,
     }
 }
 
+fn plugin_update_log_path() -> PathBuf {
+    dsh_home().join(".dsh-plugin-update.log")
+}
+
+fn notify_plugin_update(app: &tauri::AppHandle, message: &str) {
+    if let Some(window) = app.get_webview_window("main") {
+        let script = format!("alert({});", serde_json::to_string(message).unwrap());
+        let _ = window.eval(&script);
+    }
+}
+
+/// Update every dependency declared by the web profile, without touching the
+/// DSH settings or credentials files. Output is retained for support reports.
+fn update_web_profile_plugins(app: &tauri::AppHandle) {
+    if PLUGIN_UPDATE_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        notify_plugin_update(app, "插件更新已经在进行中，请等待完成。");
+        return;
+    }
+
+    let profile = dsh_home().join("profiles").join("web");
+    if !profile.is_dir() {
+        PLUGIN_UPDATE_RUNNING.store(false, Ordering::Release);
+        notify_plugin_update(app, "未找到 web profile，无法更新插件。请先启动一次 DSH。");
+        return;
+    }
+
+    let log_path = plugin_update_log_path();
+    let log_file = match fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            PLUGIN_UPDATE_RUNNING.store(false, Ordering::Release);
+            notify_plugin_update(app, &format!("无法创建插件更新日志: {error}"));
+            return;
+        }
+    };
+
+    let mut command = plugin_update_command(&profile);
+    command
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+        .env("npm_config_yes", "true")
+        .env("NO_UPDATE_NOTIFIER", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file.try_clone().unwrap()))
+        .stderr(Stdio::from(log_file));
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            PLUGIN_UPDATE_RUNNING.store(false, Ordering::Release);
+            notify_plugin_update(
+                app,
+                &format!("启动插件更新失败: {error}\n日志: {}", log_path.display()),
+            );
+            return;
+        }
+    };
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let result = child.wait();
+        PLUGIN_UPDATE_RUNNING.store(false, Ordering::Release);
+        let message = match result {
+            Ok(status) if status.success() => format!(
+                "插件已全部更新完成。\n请完全退出并重新启动 DSH 后生效。\n日志: {}",
+                log_path.display()
+            ),
+            Ok(status) => format!(
+                "插件更新失败 (退出码: {})。现有插件未被主动删除。\n日志: {}",
+                status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "未知".to_string()),
+                log_path.display()
+            ),
+            Err(error) => format!(
+                "等待插件更新进程失败: {error}\n日志: {}",
+                log_path.display()
+            ),
+        };
+        notify_plugin_update(&app, &message);
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn plugin_update_command(profile: &Path) -> Command {
+    let mut command = Command::new("cmd");
+    command
+        .arg("/C")
+        .raw_arg("\"where pnpm >nul 2>nul & if errorlevel 1 (npx -y pnpm update) else (pnpm update)\"")
+        .current_dir(profile)
+        .creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn plugin_update_command(profile: &Path) -> Command {
+    let mut command = Command::new("zsh");
+    command
+        .args([
+            "-c",
+            r#"if command -v pnpm >/dev/null 2>&1; then exec pnpm update; fi
+if command -v npx >/dev/null 2>&1; then exec npx -y pnpm update; fi
+echo 'ERROR: neither pnpm nor npx found' >&2; exit 127"#,
+        ])
+        .current_dir(profile);
+    command
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn plugin_update_command(profile: &Path) -> Command {
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            r#"if command -v pnpm >/dev/null 2>&1; then exec pnpm update; fi
+if command -v npx >/dev/null 2>&1; then exec npx -y pnpm update; fi
+echo 'ERROR: neither pnpm nor npx found' >&2; exit 127"#,
+        ])
+        .current_dir(profile);
+    command
+}
+
 fn try_reap_child(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -640,6 +779,12 @@ fn terminate_child_tree(child: &mut Child) {
 }
 
 /// 递归添加文件/目录到 zip
+///
+/// ZIP entry names are always slash-separated, regardless of the host OS.
+fn zip_entry_name(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/")
+}
+
 fn add_to_zip<W: Write + std::io::Seek>(
     zip: &mut zip::ZipWriter<W>,
     base: &Path,
@@ -663,14 +808,14 @@ fn add_to_zip<W: Write + std::io::Seek>(
             add_to_zip(zip, base, &new_rel, include_credentials)?;
         }
     } else {
-        let rel_str = rel.to_string_lossy();
+        let rel_str = zip_entry_name(rel);
         if rel_str.contains("node_modules") || rel_str.contains("sessions/") || rel_str.contains("/target") {
             return Ok(());
         }
 
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
-        zip.start_file(rel_str.as_ref(), options)
+        zip.start_file(&rel_str, options)
             .map_err(|e| e.to_string())?;
 
         let mut file = File::open(&full).map_err(|e| e.to_string())?;
@@ -679,6 +824,40 @@ fn add_to_zip<W: Write + std::io::Seek>(
         zip.write_all(&buf).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Normalize a ZIP entry before joining it to ~/.dsh.
+///
+/// ZIP files produced by older Windows builds contain `\\` separators.  Treat
+/// both separators the same, but reject absolute paths, drive-qualified paths,
+/// and parent traversal so an import can never escape the DSH home directory.
+fn normalize_zip_entry_name(name: &str) -> Option<PathBuf> {
+    let normalized = name.replace('\\', "/");
+    if normalized.is_empty() || normalized.starts_with('/') {
+        return None;
+    }
+
+    let mut path = PathBuf::new();
+    for component in normalized.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return None;
+        }
+        // Reject Windows drive prefixes even when importing on Unix.
+        if component.contains(':') {
+            return None;
+        }
+        path.push(component);
+    }
+
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+fn import_backup_root(dsh: &Path) -> PathBuf {
+    let parent = dsh.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".dsh-import-backup-{}",
+        chrono::Local::now().format("%Y%m%d-%H%M%S-%f")
+    ))
 }
 
 /// Tauri 命令:设置快捷键(从前端 invoke 调用)
@@ -730,6 +909,8 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .build(app).map_err(|e| e.to_string())?;
     let import_item = MenuItemBuilder::with_id("import", "导入配置…")
         .build(app).map_err(|e| e.to_string())?;
+    let update_plugins_item = MenuItemBuilder::with_id("update-plugins", "一键更新全部插件")
+        .build(app).map_err(|e| e.to_string())?;
     let quit_item = MenuItemBuilder::with_id("quit", "退出 DeepSeek Harness")
         .accelerator("CmdOrCtrl+Q")
         .build(app).map_err(|e| e.to_string())?;
@@ -742,6 +923,7 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .item(&export_with_cred)
         .separator()
         .item(&import_item)
+        .item(&update_plugins_item)
         .separator()
         .item(&quit_item)
         .build().map_err(|e| e.to_string())?;
@@ -911,6 +1093,8 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
     fs::create_dir_all(dsh).map_err(|e| e.to_string())?;
 
     let mut extracted = 0;
+    let backup_root = import_backup_root(dsh);
+    let mut backed_up = 0;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
         let name = entry.name().to_string();
@@ -919,7 +1103,11 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
             continue;
         }
 
-        let out_path = dsh.join(&name);
+        let Some(relative_path) = normalize_zip_entry_name(&name) else {
+            eprintln!("skipping unsafe ZIP entry: {name:?}");
+            continue;
+        };
+        let out_path = dsh.join(&relative_path);
 
         let canonical_dsh = dsh.canonicalize().unwrap_or_else(|_| dsh.to_path_buf());
         if !out_path.starts_with(&canonical_dsh) {
@@ -932,6 +1120,16 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
+            if out_path.is_file() {
+                let backup_path = backup_root.join(&relative_path);
+                if !backup_path.exists() {
+                    if let Some(parent) = backup_path.parent() {
+                        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    fs::copy(&out_path, &backup_path).map_err(|e| e.to_string())?;
+                    backed_up += 1;
+                }
+            }
             let mut out_file = File::create(&out_path).map_err(|e| e.to_string())?;
             std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
             drop(out_file);
@@ -939,7 +1137,7 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
             // macOS/Linux: credentials 文件需要 600 权限
             #[cfg(unix)]
             {
-                if name == ".credentials.yaml" {
+                if relative_path == Path::new(".credentials.yaml") {
                     use std::os::unix::fs::PermissionsExt;
                     let _ = fs::set_permissions(&out_path, fs::Permissions::from_mode(0o600));
                 }
@@ -948,7 +1146,19 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
         }
     }
 
-    Ok(format!("已导入 {} 个配置文件。\n重启 DSH 后生效。", extracted))
+    let backup_note = if backed_up > 0 {
+        format!(
+            "\n原配置已备份 ({} 个文件): {}",
+            backed_up,
+            backup_root.display()
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "已导入 {} 个配置文件。{}\n重启 DSH 后生效。",
+        extracted, backup_note
+    ))
 }
 
 /// 启动失败页的排查步骤。
@@ -1253,6 +1463,7 @@ fn main() {
                 "export-no-cred" => do_export(app, false),
                 "export-cred" => do_export(app, true),
                 "import" => do_import(app),
+                "update-plugins" => update_web_profile_plugins(app),
                 _ => {}
             }
         })
@@ -1278,6 +1489,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zip_entry_names_are_portable_across_operating_systems() {
+        let rel = PathBuf::from("profiles").join("web").join("package.json");
+        assert_eq!(zip_entry_name(&rel), "profiles/web/package.json");
+        assert_eq!(
+            normalize_zip_entry_name(r"profiles\web\package.json"),
+            Some(PathBuf::from("profiles/web/package.json"))
+        );
+    }
+
+    #[test]
+    fn zip_import_rejects_paths_that_escape_dsh_home() {
+        assert!(normalize_zip_entry_name("../settings.yaml").is_none());
+        assert!(normalize_zip_entry_name(r"profiles\..\settings.yaml").is_none());
+        assert!(normalize_zip_entry_name("/tmp/settings.yaml").is_none());
+        assert!(normalize_zip_entry_name("C:/Users/Public/settings.yaml").is_none());
+    }
 
     /// dsh 在监听端口后、BrowserAuth 激活前会短暂返回 404。这个中间态不能
     /// 被当成就绪，否则 WebView 会过早打开裸地址，随后正好撞上认证 401。

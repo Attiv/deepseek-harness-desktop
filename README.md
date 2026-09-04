@@ -21,7 +21,7 @@
 
 - 🖥️ **独立桌面窗口** — 基于 Tauri v2 + 系统原生 WebView,自带标题栏,像原生 App 一样
 - ⚡ **轻量** — 编译产物约 3 MB(对比 Electron 动辄上百 MB)
-- 🔄 **自动跟随最新版** — 启动时查 npm dist-tags,自动选**版本号最高的那个频道**再交给 `pnpm dlx`,无需用户确认任何东西。官方在 rc 阶段把新版发在 `next`(`latest` 会落后一截),裸 `npx @deepseek-ai/dsh` 拿不到,这里能拿到
+- 🔄 **稳定启动** — 默认跟随 npm `latest` 稳定频道；需要预览版时可在 `~/.dsh/settings.yaml` 显式选择 `next` 或 `newest`
 - 🚀 **智能启动** — 检测已有实例则直接复用,否则后台拉起(无黑框),轮询端口就绪后显示窗口
 - 🧹 **按归属清理后端** — 真正退出时只终止本桌面应用启动的完整 `pnpm → node → dsh` 进程树,不影响其他终端任务或复用的外部服务
 - 🌐 **跨平台** — Windows / macOS / Linux 全支持
@@ -33,7 +33,7 @@
    ↓
 检测 127.0.0.1:3080 是否已有 dsh 在跑?
    ├─ 有 → 窗口直接导航到 dsh 界面(不查版本,零网络开销)
-   └─ 无 → 查 registry 的 dist-tags,选出版本号最高的频道
+   └─ 无 → 使用 npm `latest` 稳定频道
             ↓
             后台执行 pnpm dlx @deepseek-ai/dsh@<频道> web --no-open(隐藏窗口)
             ↓
@@ -50,7 +50,7 @@
 - 普通关闭主窗口只会隐藏窗口,应用及其启动的后端继续运行,可通过快捷键重新唤回。
 - 如果启动时在 `127.0.0.1:3080` 检测到可正常响应的已有 dsh/HTTP 服务,应用只会复用它；退出应用时不会终止这个外部服务。
 
-### 为什么要自己选频道
+### 为什么默认使用稳定频道
 
 npm 的 `latest` 标签由发布者控制,rc 阶段它常常故意落后:
 
@@ -60,8 +60,8 @@ $ npm view @deepseek-ai/dsh dist-tags
 ```
 
 裸 `npx @deepseek-ai/dsh` 解析的是 `latest`,所以只会拿到 rc.7 —— 加 `@latest` 也一样。
-壳启动时比较各个 tag 实际指向的版本号(按 semver,`rc.10 > rc.9`),挑最高的那个 tag 传给 pnpm dlx,
-于是 rc 阶段跟到 `next`,GA 之后 `latest` 反超时又自动切回去,两个方向都成立。
+预览版可能先于第三方 profile 插件适配，导致模型选择等 UI 槽位不兼容。壳默认使用
+`latest`，需要测试预览版时再显式设置 `app-dsh-channel: next` 或 `newest`。
 
 ### 为什么传 tag 而不是精确版本号
 
@@ -142,11 +142,11 @@ dsh-app/
 
 ### 锁定 dsh 版本(可选)
 
-默认自动跟最新,不需要配置。若某个新版有问题,在 `~/.dsh/settings.yaml` 加一行即可:
+默认跟官方稳定频道,避免预览版与 profile 插件不兼容。若需要切换频道,在 `~/.dsh/settings.yaml` 加一行即可:
 
 ```yaml
-app-dsh-channel: newest       # 默认:自动选版本最高的频道
-# app-dsh-channel: latest     # 只跟官方稳定频道
+app-dsh-channel: latest       # 默认:只跟官方稳定频道
+# app-dsh-channel: newest     # 自动选版本最高的频道(可能包含预览版)
 # app-dsh-channel: next       # 只跟预览频道
 # app-dsh-channel: 0.1.0-rc.7 # 钉死某个版本
 ```

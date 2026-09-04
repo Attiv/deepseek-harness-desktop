@@ -33,8 +33,9 @@ jobs:
             - **Linux**: 下载 `.AppImage` 或 `.deb`
 
             ### 说明
-            - 启动时自动解析 npm dist-tags,选版本最高的频道(rc 阶段跟 `next`,GA 后 `latest` 反超自动切回)
-            - 后端优先走 `pnpm dlx @deepseek-ai/dsh@<频道> web --no-open`,没装 pnpm 时自动回退 `npx -y`,官方发新版后下次启动自动升级,无需重新下载 App
+            - 默认使用 npm `latest` 稳定频道,避免预览版与 profile 插件不兼容；可通过 `app-dsh-channel` 显式选择 `next` 或 `newest`
+            - 后端优先走 `pnpm dlx @deepseek-ai/dsh@<频道> web --no-open`,没装 pnpm 时自动回退 `npx -y`
+            - 菜单「配置 → 一键更新全部插件」会更新 web profile 的全部插件,完成后重启 DSH 生效
             - 需要 **Node.js ≥ 22.19**(新版 dsh 依赖);pnpm 可选
           draft: false
           prerelease: false
