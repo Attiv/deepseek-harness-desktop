@@ -33,7 +33,8 @@ jobs:
             - **Linux**: 下载 `.AppImage` 或 `.deb`
 
             ### 说明
-            - 默认使用 npm `latest` 稳定频道,避免预览版与 profile 插件不兼容；可通过 `app-dsh-channel` 显式选择 `next` 或 `newest`
+            - 修复桌面启动轮询卡死、进度停更及启动超时失效
+            - 默认使用 npm `next` 预览频道；可通过菜单「配置 → DSH 频道」切回 `latest` 稳定版
             - 后端优先走 `pnpm dlx @deepseek-ai/dsh@<频道> web --no-open`,没装 pnpm 时自动回退 `npx -y`
             - 菜单「配置 → 一键更新全部插件」会更新 web profile 的全部插件,完成后重启 DSH 生效
             - 需要 **Node.js ≥ 22.19**(新版 dsh 依赖);pnpm 可选

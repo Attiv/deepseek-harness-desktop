@@ -96,6 +96,48 @@ class LauncherCommandTests(unittest.TestCase):
             r"\bstop_owned_dsh\s*\(\s*app\s*\)\s*;",
         )
 
+    def test_default_channel_is_next_not_latest(self):
+        """跟 latest 会让壳长期落后于上游预览版,表现为「客户端卡住/不工作」,
+        用户只能退回终端手跑 @next。默认必须是 next。"""
+        self.assertRegex(self.source, r'const DEFAULT_CHANNEL:\s*&str\s*=\s*"next"')
+        self.assertNotRegex(
+            self.source,
+            r'const DEFAULT_CHANNEL:\s*&str\s*=\s*"latest"',
+            "默认频道不能是 latest",
+        )
+
+    def test_menu_offers_channel_switch(self):
+        """菜单里要能切 next / latest,并反映当前生效值(勾选态)。"""
+        self.assertIn('SubmenuBuilder::new(app, "DSH 频道")', self.source)
+        self.assertIn('("next", "next(预览版,默认)")', self.source)
+        self.assertIn('("latest", "latest(稳定版)")', self.source)
+        self.assertRegex(
+            self.source,
+            r'CheckMenuItemBuilder::with_id\(',
+            "频道项应使用可勾选菜单项",
+        )
+        self.assertRegex(self.source, r"\.checked\(\*id == active_channel\)")
+
+    def test_channel_menu_click_writes_the_setting(self):
+        """点击频道项必须落盘,否则重启后仍是旧频道。"""
+        self.assertRegex(
+            self.source,
+            r'id\.starts_with\("channel-"\)\s*=>',
+            "菜单事件里应处理 channel-* 的 id",
+        )
+        self.assertRegex(
+            self.source,
+            r'write_setting_value\(\s*"app-dsh-channel"\s*,\s*channel\s*\)',
+        )
+
+    def test_launcher_log_is_appended_so_failures_survive(self):
+        """日志被 truncate 会抹掉上一次启动失败的现场 —— 那正是排查卡顿的唯一证据。"""
+        spawn = self.source[
+            self.source.index("fn spawn_dsh("):self.source.index("// pnpm dlx 会直接安装临时包")
+        ]
+        self.assertIn(".append(true)", spawn, "启动日志必须追加写入")
+        self.assertNotIn(".truncate(true)", spawn, "启动日志不能用 truncate")
+
     def test_menu_exposes_all_plugin_update(self):
         self.assertIn('with_id("update-plugins", "一键更新全部插件")', self.source)
         self.assertIn('"version",', self.source)
@@ -145,6 +187,107 @@ class LauncherCommandTests(unittest.TestCase):
             r"\bstop_owned_dsh\s*\(\s*app\s*\)\s*;",
         )
 
+    def test_progress_is_reported_before_and_during_the_backend_spawn(self):
+        """版本解析可能有 5s 的 registry 请求;spawn 前就要让加载页显示阶段,
+        否则那段时间窗口里没有任何反馈。"""
+        main = self.source[
+            self.source.index("fn main() {"):self.source.index("#[cfg(test)]")
+        ]
+        spawn = main.index("spawn_dsh(&spec)")
+        resolve = main.index("let spec = resolve_dsh_spec();")
+        self.assertRegex(
+            main[:resolve],
+            r"push_boot_progress\s*\(\s*&main_window\s*,\s*BootStage::Resolve",
+            "解析版本前就要推送阶段",
+        )
+        self.assertRegex(
+            main[resolve:spawn],
+            r"push_boot_progress\s*\(\s*&main_window\s*,\s*BootStage::Spawn",
+            "spawn 前要推送阶段并把 spec 作为细节显示",
+        )
+
+    def test_startup_poll_loop_reports_progress_and_failures(self):
+        """启动轮询必须三件事齐全:推阶段、查后端是否提前退出、超时报错。"""
+        window = self.source[
+            self.source.index("let window = main_window.clone();"):
+            self.source.index(".on_menu_event", self.source.index("let window = main_window.clone();"))
+        ]
+        self.assertRegex(window, r"push_boot_progress\s*\(\s*&window\s*,")
+        self.assertRegex(window, r"push_boot_failure\s*\(\s*&window\s*,")
+        self.assertIn("child.try_wait()", window, "必须检测后端是否已退出")
+        self.assertIn("tail_launcher_log", window, "错误页要带日志现场")
+        self.assertIn("timeout_secs", window, "错误信息要带实际等待时长")
+
+    def test_synchronous_startup_loop_uses_blocking_worker(self):
+        """reqwest blocking + sleep 不能放在永不 await 的 async task 中。"""
+        window = self.source[
+            self.source.index("let window = main_window.clone();"):
+            self.source.index(".on_menu_event", self.source.index("let window = main_window.clone();"))
+        ]
+        self.assertIn("spawn_boot_worker(move || {", window)
+        self.assertNotIn("async move", window)
+        worker = re.search(
+            r"fn spawn_boot_worker\b[\s\S]*?\n\}", self.source
+        )
+        self.assertIsNotNone(worker)
+        self.assertIn("tauri::async_runtime::spawn_blocking(task)", worker.group())
+
+    def test_failed_startup_releases_the_owned_backend(self):
+        """自己拉起的后端起不来时不能把进程留着继续占 3080 端口。"""
+        window = self.source[
+            self.source.index("let window = main_window.clone();"):
+            self.source.index(".on_menu_event", self.source.index("let window = main_window.clone();"))
+        ]
+        failure = window[window.index("push_boot_failure(&window, stage, &report);"):]
+        self.assertRegex(
+            failure,
+            r"take_owned_child\s*\(\s*&state\s*\)",
+            "超时后应取回并终止自己拉起的后端",
+        )
+        self.assertRegex(failure, r"terminate_child_tree\s*\(")
+
+    def test_loading_page_exposes_the_progress_protocol(self):
+        """Rust 用 window.eval 调 __dshBoot;两边的阶段 id 必须一致。"""
+        page = (SOURCE_PATH.parents[2] / "dist/index.html").read_text()
+        self.assertIn("window.__dshBoot", page)
+        self.assertIn("update:", page)
+        self.assertIn("fail:", page)
+        for stage in ("probe", "resolve", "spawn", "download", "auth", "ready"):
+            with self.subTest(stage=stage):
+                self.assertIn(
+                    "'{}'".format(stage),
+                    page,
+                    "加载页缺少阶段 {} —— Rust 侧推送对应 id 时不会高亮任何步骤".format(stage),
+                )
+
+    def test_loading_page_renders_failure_guidance(self):
+        """失败要抛出来并给建议,而不是只留一个转圈。"""
+        page = (SOURCE_PATH.parents[2] / "dist/index.html").read_text()
+        self.assertIn("errtitle", page)
+        self.assertIn("errreason", page)
+        self.assertIn("errsteps", page)
+        self.assertIn("err.classList.add('show')", page)
+
+    def test_loading_page_stops_the_spinner_on_failure(self):
+        """失败后不能继续转圈:必须换掉 spinner 状态并停掉耗时计时器。"""
+        page = (SOURCE_PATH.parents[2] / "dist/index.html").read_text()
+        self.assertIn("spinner failed", page)
+        self.assertRegex(
+            page,
+            r"timerId\s*=\s*setInterval",
+            "耗时计时器要存下 id,否则失败时无法停止",
+        )
+        self.assertRegex(page, r"clearInterval\s*\(\s*timerId\s*\)")
+
+    def test_step_detail_is_written_after_the_steps_are_created(self):
+        """步骤节点是首次 update 时懒创建的;在那之前写 detail 会落在不存在的节点上,
+        表现为「阶段高亮了但后面的细节永远是空的」。"""
+        page = (SOURCE_PATH.parents[2] / "dist/index.html").read_text()
+        update_body = page[page.index("update: function"):page.index("fail: function")]
+        paint = update_body.index("paintSteps();")
+        detail = update_body.index("setDetail(payload.stage, payload.detail)")
+        self.assertLess(paint, detail, "setDetail 必须排在 paintSteps 之后")
+
     def test_backend_startup_is_deferred_until_tauri_setup_succeeds(self):
         main = self.source[
             self.source.index("fn main() {"):self.source.index("#[cfg(test)]")
@@ -159,9 +302,7 @@ class LauncherCommandTests(unittest.TestCase):
         setup = main.index(".setup(move |app| {")
         menu_events = main.index(".on_menu_event", setup)
 
-        spawn_calls = list(
-            re.finditer(r"\bspawn_dsh\s*\(\s*&resolve_dsh_spec\(\)\s*\)", main)
-        )
+        spawn_calls = list(re.finditer(r"\bspawn_dsh\s*\(\s*&spec\s*\)", main))
         self.assertEqual(len(spawn_calls), 1, "main should have one deferred backend spawn")
         spawn = spawn_calls[0].start()
 

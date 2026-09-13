@@ -1,34 +1,289 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <title>DeepSeek Harness</title>
   <style>
-    html,body{margin:0;height:100%;background:#0d1117;color:#c9d1d9;
-      font-family:"Segoe UI",system-ui,sans-serif;display:flex;
-      align-items:center;justify-content:center;flex-direction:column;gap:18px}
-    .spinner{width:42px;height:42px;border:4px solid #21262d;border-top-color:#58a6ff;
-      border-radius:50%;animation:spin .9s linear infinite}
-    @keyframes spin{to{transform:rotate(360deg)}}
-    .t{font-size:15px;opacity:.85}
-    .s{font-size:12px;opacity:.5;font-family:Consolas,monospace}
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --line: #21262d;
+      --text: #c9d1d9;
+      --dim: #8b949e;
+      --accent: #58a6ff;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --bad: #f85149;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; background: var(--bg); color: var(--text);
+      font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+      display: flex; align-items: center; justify-content: center;
+      flex-direction: column; gap: 16px; padding: 32px;
+    }
+    .wrap { width: 100%; max-width: 620px; display: flex; flex-direction: column; gap: 14px; }
+    .head { display: flex; align-items: center; gap: 12px; }
+    .spinner {
+      width: 22px; height: 22px; flex: none; border: 3px solid var(--line);
+      border-top-color: var(--accent); border-radius: 50%; animation: spin .9s linear infinite;
+    }
+    .spinner.done { border-color: var(--ok); border-top-color: var(--ok); animation: none; }
+    .spinner.failed { border-color: var(--bad); border-top-color: var(--bad); animation: none; }
+    @keyframes spin { to { transform: rotate(360deg) } }
+    .title { font-size: 16px; font-weight: 600; }
+    .bar { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; }
+    .bar > i {
+      display: block; height: 100%; width: 0%; background: var(--accent);
+      border-radius: 2px; transition: width .5s ease;
+    }
+    .bar.failed > i { background: var(--bad); }
+    .bar.done > i { background: var(--ok); }
+    .meta { display: flex; justify-content: space-between; font-size: 12px; color: var(--dim); font-family: ui-monospace, Consolas, monospace; }
+    ol.steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+    ol.steps li {
+      display: flex; gap: 10px; align-items: baseline; font-size: 13px;
+      color: var(--dim); line-height: 1.5;
+    }
+    ol.steps li .dot {
+      flex: none; width: 14px; font-family: ui-monospace, Consolas, monospace; text-align: center;
+    }
+    ol.steps li.active { color: var(--text); }
+    ol.steps li.active .dot { color: var(--accent); }
+    ol.steps li.done .dot { color: var(--ok); }
+    ol.steps li.done { color: var(--dim); }
+    ol.steps li.failed .dot { color: var(--bad); }
+    ol.steps li.failed { color: var(--bad); }
+    ol.steps li .detail { color: var(--dim); font-size: 12px; }
+    details.log {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+      padding: 8px 10px; font-size: 12px;
+    }
+    details.log summary { cursor: pointer; color: var(--dim); outline: none; }
+    pre.log {
+      margin: 8px 0 0; max-height: 180px; overflow: auto; white-space: pre-wrap;
+      word-break: break-all; font-family: ui-monospace, Consolas, monospace;
+      font-size: 11.5px; line-height: 1.5; color: var(--dim);
+    }
+    .hints { font-size: 12.5px; color: var(--warn); line-height: 1.6; display: none; }
+    .hints.show { display: block; }
+    .err {
+      display: none; background: #2d1618; border: 1px solid var(--bad); border-radius: 6px;
+      padding: 12px 14px; font-size: 13px; line-height: 1.6;
+    }
+    .err.show { display: block; }
+    .err h2 { margin: 0 0 8px; font-size: 15px; color: var(--bad); }
+    .err .reason { margin: 0 0 10px; }
+    .err ol { margin: 0; padding-left: 20px; }
+    .err li { margin-bottom: 6px; }
+    code { background: #21262d; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+    a { color: var(--accent); }
   </style>
 </head>
 <body>
-  <div class="spinner"></div>
-  <div class="t">正在启动 DeepSeek Harness…</div>
-  <div class="s">pnpm dlx @deepseek-ai/dsh@&lt;最新频道&gt; web --no-open</div>
-  <div class="s" id="hint" style="opacity:0;transition:opacity .8s">首次启动或版本更新需先下载约 220 MB,请耐心等待</div>
-  <div class="s" id="hint2" style="opacity:0;transition:opacity .8s;color:#ff8c69">若长时间未就绪,请确认已安装 Node.js 与 pnpm → https://pnpm.io/zh/installation</div>
-  <script>
-    // 只在等得久了才提示下载,正常秒起时不吓人
-    setTimeout(function () {
-      document.getElementById('hint').style.opacity = '.5';
-    }, 8000);
-    // 超过 30 秒仍未就绪,提示安装 pnpm
-    setTimeout(function () {
-      document.getElementById('hint2').style.opacity = '1';
-    }, 30000);
-  </script>
+<div class="wrap">
+  <div class="head">
+    <div class="spinner" id="spinner"></div>
+    <div class="title" id="title">正在启动 DeepSeek Harness…</div>
+  </div>
+
+  <div class="bar" id="bar"><i id="barfill"></i></div>
+  <div class="meta">
+    <span id="stage">准备中</span>
+    <span id="elapsed">0.0s</span>
+  </div>
+
+  <ol class="steps" id="steps"></ol>
+
+  <details class="log" id="logbox">
+    <summary id="logsummary">启动日志</summary>
+    <pre class="log" id="log">（暂无输出）</pre>
+  </details>
+
+  <div class="err" id="err">
+    <h2 id="errtitle">DSH 启动失败</h2>
+    <p class="reason" id="errreason"></p>
+    <p style="margin:0 0 6px"><strong>建议按顺序排查：</strong></p>
+    <ol id="errsteps"></ol>
+    <p style="margin:10px 0 0;opacity:.75">错误详情：<code id="errdetail"></code></p>
+  </div>
+</div>
+
+<script>
+// Rust 侧通过 window.eval 调用这里的两个入口推送启动进度:
+//   window.__dshBoot.update({...})  更新阶段
+//   window.__dshBoot.fail({...})    进入失败态
+// 不使用 Tauri event(需要 withGlobalTauri + 事件权限),eval 在本窗口始终可用。
+(function () {
+  var startedAt = Date.now();
+  var STEPS = [
+    { id: 'probe',     label: '检查 127.0.0.1:3080 是否已有实例' },
+    { id: 'resolve',   label: '解析 DSH 版本频道' },
+    { id: 'spawn',     label: '拉起后端进程（pnpm dlx / npx -y）' },
+    { id: 'download',  label: '下载或校验 DSH 包（首次约 220 MB）' },
+    { id: 'listen',    label: '等待 HTTP 端口就绪' },
+    { id: 'auth',      label: '交换认证 token 并注入 WebView cookie' },
+    { id: 'ready',     label: '加载界面' }
+  ];
+  // 每个阶段的最小进度百分比:进度条只增不减,避免阶段回退时视觉跳动
+  var FLOOR = { probe: 5, resolve: 12, spawn: 24, download: 42, listen: 62, auth: 85, ready: 100 };
+
+  var el = {
+    spinner: document.getElementById('spinner'),
+    title: document.getElementById('title'),
+    bar: document.getElementById('bar'),
+    barfill: document.getElementById('barfill'),
+    stage: document.getElementById('stage'),
+    elapsed: document.getElementById('elapsed'),
+    steps: document.getElementById('steps'),
+    log: document.getElementById('log'),
+    logsummary: document.getElementById('logsummary'),
+    hints: document.querySelector('.hints'),
+    err: document.getElementById('err'),
+    errtitle: document.getElementById('errtitle'),
+    errreason: document.getElementById('errreason'),
+    errsteps: document.getElementById('errsteps'),
+    errdetail: document.getElementById('errdetail')
+  };
+
+  var rendered = {};
+  var currentStage = 'probe';
+  var lastPercent = 0;
+
+  function stepNodes() {
+    if (el.steps.childElementCount !== STEPS.length) {
+      el.steps.textContent = '';
+      STEPS.forEach(function (step) {
+        var li = document.createElement('li');
+        li.dataset.step = step.id;
+        var dot = document.createElement('span');
+        dot.className = 'dot';
+        dot.textContent = '·';
+        var body = document.createElement('span');
+        body.className = 'label';
+        body.textContent = step.label;
+        var detail = document.createElement('span');
+        detail.className = 'detail';
+        li.appendChild(dot);
+        li.appendChild(body);
+        li.appendChild(detail);
+        el.steps.appendChild(li);
+      });
+    }
+    return el.steps.querySelectorAll('li');
+  }
+
+  function paintSteps() {
+    var nodes = stepNodes();
+    var order = STEPS.map(function (s) { return s.id; });
+    var activeIndex = order.indexOf(currentStage);
+    nodes.forEach(function (li) {
+      var id = li.dataset.step;
+      var index = order.indexOf(id);
+      li.classList.remove('active', 'done', 'failed');
+      var dot = li.querySelector('.dot');
+      if (index < activeIndex) {
+        li.classList.add('done');
+        dot.textContent = '✓';
+      } else if (index === activeIndex) {
+        li.classList.add('active');
+        dot.textContent = '▶';
+      } else {
+        dot.textContent = '·';
+      }
+    });
+  }
+
+  function setDetail(stageId, text) {
+    var node = el.steps.querySelector('li[data-step="' + stageId + '"] .detail');
+    if (node) node.textContent = text ? '  ' + text : '';
+  }
+
+  function setPercent(percent) {
+    var value = Math.max(0, Math.min(100, Math.round(percent)));
+    if (value < lastPercent) value = lastPercent;
+    lastPercent = value;
+    el.barfill.style.width = value + '%';
+  }
+
+  function tickElapsed() {
+    var seconds = (Date.now() - startedAt) / 1000;
+    el.elapsed.textContent = seconds.toFixed(1) + 's';
+  }
+
+  var timerId = setInterval(tickElapsed, 200);
+  tickElapsed();
+
+  window.__dshBoot = {
+    // 更新当前阶段。payload: { stage, percent, detail, title, log, hints }
+    update: function (payload) {
+      payload = payload || {};
+      if (payload.stage) currentStage = payload.stage;
+      if (typeof payload.percent === 'number') setPercent(payload.percent);
+      if (payload.title) el.title.textContent = payload.title;
+      if (typeof payload.log === 'string') {
+        el.log.textContent = payload.log.trim() === '' ? '（暂无输出）' : payload.log;
+      }
+      if (Array.isArray(payload.hints) && payload.hints.length > 0) {
+        // 就地生成提示行,避免依赖预置元素
+        var hints = document.getElementById('dsh-boot-hints');
+        if (!hints) {
+          hints = document.createElement('div');
+          hints.id = 'dsh-boot-hints';
+          hints.className = 'hints show';
+          el.err.parentNode.insertBefore(hints, el.err);
+        }
+        hints.className = 'hints show';
+        hints.textContent = payload.hints.join('\n');
+        hints.style.whiteSpace = 'pre-wrap';
+      }
+      paintSteps();
+      // 必须放在 paintSteps 之后:步骤节点是首次 update 时才懒创建的,
+      // 之前就写 detail 会落在一个还不存在的节点上。
+      if (payload.stage) setDetail(payload.stage, payload.detail);
+    },
+    // 进入失败态。payload: { title, reason, detail, steps: [html...], log }
+    fail: function (payload) {
+      payload = payload || {};
+      currentStage = payload.stage || currentStage;
+      clearInterval(timerId);
+      tickElapsed();
+      var nodes = stepNodes();
+      nodes.forEach(function (li) {
+        li.classList.remove('active');
+        if (li.dataset.step === currentStage) {
+          li.classList.add('failed');
+          li.querySelector('.dot').textContent = '✗';
+        }
+      });
+      el.spinner.className = 'spinner failed';
+      el.bar.className = 'bar failed';
+      setPercent(lastPercent);
+      el.title.textContent = '启动失败';
+      el.errtitle.textContent = payload.title || 'DSH 启动失败';
+      el.errreason.textContent = payload.reason || '未知原因。';
+      el.errdetail.textContent = payload.detail || '（无）';
+      el.errsteps.textContent = '';
+      (payload.steps || []).forEach(function (html) {
+        var li = document.createElement('li');
+        li.innerHTML = html;
+        el.errsteps.appendChild(li);
+      });
+      el.err.classList.add('show');
+      if (typeof payload.log === 'string') {
+        el.log.textContent = payload.log.trim() === '' ? '（暂无输出）' : payload.log;
+        el.log.parentNode.open = true;
+      }
+      document.getElementById('logsummary').textContent = '启动日志（排查用）';
+    },
+    // 就绪前的最后一步,让用户看到"正在加载界面"
+    ready: function () {
+      window.__dshBoot.update({ stage: 'ready', percent: 100, title: '正在加载界面…' });
+      el.spinner.className = 'spinner done';
+      el.bar.className = 'bar done';
+    }
+  };
+})();
+</script>
 </body>
 </html>

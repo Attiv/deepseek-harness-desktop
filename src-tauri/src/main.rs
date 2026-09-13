@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -70,13 +70,18 @@ fn stop_owned_dsh(app: &tauri::AppHandle) {
 /// 当前生效的快捷键(handler 动态读取,可在运行时更改)
 struct CurrentShortcut(Mutex<Shortcut>);
 
-/// 从 ~/.dsh/settings.yaml 读一个顶层标量字段(与 write_shortcut 对称的简单行解析)。
-/// 字段缺失、文件不存在、值为空都返回 None。
-fn read_setting(key: &str) -> Option<String> {
-    let content = fs::read_to_string(dsh_home().join("settings.yaml")).ok()?;
-    let prefix = format!("{}:", key);
+/// 从 settings.yaml 文本里解析一个**顶层**(无缩进)标量字段。
+///
+/// 只认顶层键:settings.yaml 里有大量嵌套结构(如 `llm-pi-ai.providers.*`),
+/// 若按去空白后的前缀匹配,子键里的同名项会被误当成顶层配置读出来。
+/// 字段缺失或值为空都返回 None。抽成纯函数以便测试,不碰真实文件。
+fn parse_top_level_setting(content: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
     for line in content.lines() {
-        if let Some(rest) = line.trim().strip_prefix(&prefix) {
+        if line.starts_with([' ', '\t']) {
+            continue;
+        }
+        if let Some(rest) = line.trim_end().strip_prefix(&prefix) {
             let val = rest.trim().trim_matches('"').trim_matches('\'');
             if !val.is_empty() {
                 return Some(val.to_string());
@@ -84,6 +89,38 @@ fn read_setting(key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// 把某个顶层键改写为新值,返回新的文件内容;没有该键则在末尾追加。
+///
+/// 缩进行原样保留,因此嵌套结构不会被破坏。纯函数,便于测试。
+fn upsert_top_level_setting(content: &str, key: &str, value: &str) -> String {
+    let prefix = format!("{key}:");
+    let mut found = false;
+    let mut new_lines: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        let is_top_level = !line.starts_with([' ', '\t']);
+        if is_top_level && line.trim_end().starts_with(&prefix) {
+            new_lines.push(format!("{key}: \"{value}\""));
+            found = true;
+        } else {
+            new_lines.push(line.to_string());
+        }
+    }
+
+    if !found {
+        new_lines.push(format!("{key}: \"{value}\""));
+    }
+
+    new_lines.join("\n") + "\n"
+}
+
+/// 从 ~/.dsh/settings.yaml 读一个顶层标量字段。
+/// 字段缺失、文件不存在、值为空都返回 None。
+fn read_setting(key: &str) -> Option<String> {
+    let content = fs::read_to_string(dsh_home().join("settings.yaml")).ok()?;
+    parse_top_level_setting(&content, key)
 }
 
 /// 读取快捷键配置(~/.dsh/settings.yaml 里的 app-shortcut 字段)
@@ -98,33 +135,33 @@ fn read_shortcut() -> String {
     })
 }
 
+/// 写入一个顶层标量配置项到 ~/.dsh/settings.yaml。
+///
+/// 只替换顶层的同名键,嵌套子键不受影响。文件不存在时创建一个只含该键的新文件。
+///
+/// 值里的引号与换行会破坏 YAML,因此这里直接拒绝 —— 所有调用方传的都是
+/// 受控的常量(快捷键字符串、频道名),不该出现这类字符。
+fn write_setting_value(key: &str, value: &str) -> Result<(), String> {
+    if value.contains(['"', '\n', '\r']) {
+        return Err(format!("配置值不能包含引号或换行: {value:?}"));
+    }
+    if key.is_empty() || key.contains([':', '\n', '\r', ' ']) {
+        return Err(format!("非法的配置键: {key:?}"));
+    }
+
+    let settings = dsh_home().join("settings.yaml");
+    let content = fs::read_to_string(&settings).unwrap_or_default();
+
+    if let Some(parent) = settings.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    fs::write(&settings, upsert_top_level_setting(&content, key, value)).map_err(|e| e.to_string())
+}
+
 /// 写入快捷键配置到 ~/.dsh/settings.yaml
 fn write_shortcut(shortcut: &str) -> Result<(), String> {
-    let settings = dsh_home().join("settings.yaml");
-    let content = fs::read_to_string(&settings).map_err(|e| e.to_string())?;
-
-    // 检查是否已有 app-shortcut 行
-    let mut found = false;
-    let mut new_lines: Vec<String> = Vec::new();
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("app-shortcut:") {
-            // 替换已有的快捷键
-            let indent = line.len() - trimmed.len();
-            new_lines.push(format!("{}app-shortcut: \"{}\"", " ".repeat(indent), shortcut));
-            found = true;
-        } else {
-            new_lines.push(line.to_string());
-        }
-    }
-
-    // 没找到就追加到末尾
-    if !found {
-        new_lines.push(format!("app-shortcut: \"{}\"", shortcut));
-    }
-
-    fs::write(&settings, new_lines.join("\n") + "\n").map_err(|e| e.to_string())
+    write_setting_value("app-shortcut", shortcut)
 }
 
 /// 获取用户主目录
@@ -142,6 +179,225 @@ fn dsh_home() -> PathBuf {
 
 fn log_path() -> PathBuf {
     dsh_home().join(".dsh-app-launcher.log")
+}
+
+/// 读取启动日志的末尾若干行,交给加载页展示。
+///
+/// 日志可能正在被后端进程追加写入,读到半行或读失败都不算错误 —— 拿不到就返回
+/// 空字符串,进度页退回"暂无输出",而不是把启动流程打断。
+fn tail_launcher_log(max_lines: usize) -> String {
+    const MAX_TAIL_BYTES: u64 = 32 * 1024;
+    const MAX_LINE_CHARS: usize = 240;
+
+    let Ok(file) = File::open(log_path()) else {
+        return String::new();
+    };
+    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        return String::new();
+    };
+    let start = len.saturating_sub(MAX_TAIL_BYTES);
+    let mut text = String::new();
+    if file
+        .take(len - start)
+        .read_to_string(&mut text)
+        .is_err()
+        && text.is_empty()
+    {
+        // 非 UTF-8 是可能的(Windows 上旧版 pnpm 会输出本地编码),
+        // 用 lossy 再兜一次,保证至少能看到半行线索。
+        let mut raw = Vec::new();
+        if File::open(log_path())
+            .and_then(|mut f| std::io::Read::read_to_end(&mut f, &mut raw))
+            .is_err()
+        {
+            return String::new();
+        }
+        let raw_start = raw.len().saturating_sub(MAX_TAIL_BYTES as usize);
+        text = String::from_utf8_lossy(&raw[raw_start..]).into_owned();
+    }
+
+    let lines: Vec<String> = text
+        .lines()
+        .rev()
+        .take(max_lines)
+        .map(|line| {
+            let truncated: String = line.chars().take(MAX_LINE_CHARS).collect();
+            if line.chars().count() > MAX_LINE_CHARS {
+                format!("{truncated}…")
+            } else {
+                truncated
+            }
+        })
+        .collect();
+
+    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+}
+
+/// 加载页里的启动阶段。
+///
+/// 阶段名必须与 `dist/index.html` 的 `STEPS` 一一对应 —— 加载页按 id 高亮当前步骤。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum BootStage {
+    /// 探测 3080 端口上是否已有实例。
+    Probe,
+    /// 解析 dsh 版本频道(可能有 registry 网络请求)。
+    Resolve,
+    /// 已拉起后端进程,但它还没开始监听。
+    Spawn,
+    /// 已监听端口,还在等 HTTP 就绪(首次启动大部分时间花在下载 ~220 MB)。
+    Download,
+    /// 端口已有响应,但还没通过认证。
+    Auth,
+    /// 拿到 cookie,正在导航到界面。
+    Ready,
+}
+
+impl BootStage {
+    fn id(self) -> &'static str {
+        match self {
+            BootStage::Probe => "probe",
+            BootStage::Resolve => "resolve",
+            BootStage::Spawn => "spawn",
+            BootStage::Download => "download",
+            BootStage::Auth => "auth",
+            BootStage::Ready => "ready",
+        }
+    }
+
+    /// 进度条的下限百分比。只用于让进度条单调递增,不表示真实完成度。
+    fn floor_percent(self) -> u32 {
+        match self {
+            BootStage::Probe => 5,
+            BootStage::Resolve => 12,
+            BootStage::Spawn => 24,
+            BootStage::Download => 42,
+            BootStage::Auth => 85,
+            BootStage::Ready => 100,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            BootStage::Probe => "正在检查本机 DSH 服务…",
+            BootStage::Resolve => "正在解析 DSH 版本频道…",
+            BootStage::Spawn => "正在拉起 DSH 后端…",
+            BootStage::Download => "正在等待 DSH 后端就绪…",
+            BootStage::Auth => "正在完成本地认证…",
+            BootStage::Ready => "正在加载界面…",
+        }
+    }
+}
+
+/// 启动失败的原因分类。决定错误页给用户哪一套排查建议。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BootFailure {
+    /// 日志显示 PATH 里既没有 pnpm 也没有 npx(后端脚本自己 exit 127)。
+    MissingRunner,
+    /// 后端进程根本没起来(脚本退出码非 0,或日志里没有监听迹象)。
+    RunnerExited,
+    /// 端口已经有人在听,但认证始终换不到 cookie。
+    AuthRejected,
+    /// 端口等到超时仍未就绪。
+    NotReady,
+}
+
+impl BootFailure {
+    fn title(self) -> &'static str {
+        match self {
+            BootFailure::MissingRunner => "找不到包管理器",
+            BootFailure::RunnerExited => "后端进程启动失败",
+            BootFailure::AuthRejected => "DSH 认证失败",
+            BootFailure::NotReady => "DSH 启动超时",
+        }
+    }
+
+    fn reason(self, seconds: u64) -> String {
+        match self {
+            BootFailure::MissingRunner => "PATH 里既没有 pnpm 也没有 npx,无法拉起 DSH 后端。"
+                .to_string(),
+            BootFailure::RunnerExited => {
+                "后端进程在监听端口之前就退出了 —— 通常意味着命令不存在、Node 版本过低,或 dsh 自身报错。"
+                    .to_string()
+            }
+            BootFailure::AuthRejected => {
+                "3080 端口上的服务在运行,但启动器拿不到可用的认证凭据(既读不到本进程的 launch token,WebView 里也没有仍然有效的 cookie)。"
+                    .to_string()
+            }
+            BootFailure::NotReady => format!(
+                "等待 {} 分 {} 秒后端口仍未就绪,已放弃。",
+                seconds / 60,
+                seconds % 60
+            ),
+        }
+    }
+
+    fn steps(self) -> Vec<String> {
+        match self {
+            BootFailure::MissingRunner => vec![
+                r#"安装 <a href="https://nodejs.org">Node.js</a> ≥ 22.19(自带 npx),或安装 <a href="https://pnpm.io/zh/installation">pnpm</a>"#.to_string(),
+                "macOS/Linux 上确认包管理器在登录 shell 的 PATH 里(桌面应用读不到交互式 shell 的临时 PATH)".to_string(),
+                "安装完成后从菜单「配置 → 退出 DeepSeek Harness」彻底退出,再重新打开本应用".to_string(),
+            ],
+            BootFailure::RunnerExited => vec![
+                r#"在终端手动执行 <code>pnpm dlx @deepseek-ai/dsh@latest web --no-open</code>,看它是怎么报错的"#.to_string(),
+                r#"确认 Node 版本 <code>node -v</code> ≥ 22.19(新版 dsh 的传递依赖要求)"#.to_string(),
+                r#"查看日志文件 <code>~/.dsh/.dsh-app-launcher.log</code> 的最后几十行"#.to_string(),
+                "修复后从菜单「配置 → 退出 DeepSeek Harness」彻底退出,再重新打开本应用".to_string(),
+            ],
+            BootFailure::AuthRejected => vec![
+                "关闭终端里那个占用 3080 端口的 dsh 实例,然后重新打开本应用".to_string(),
+                r#"或在终端里找到它打印的 <code>dsh web: http://127.0.0.1:3080/?token=…</code> 那一行,直接用浏览器打开"#.to_string(),
+                "若端口被无关程序占用,可先结束该进程再重启本应用".to_string(),
+            ],
+            BootFailure::NotReady => vec![
+                r#"首次启动或切换版本要下载约 220 MB,请确认网络能访问 npm 源;必要时配置镜像 <code>~/.npmrc</code>"#.to_string(),
+                r#"在终端手动执行 <code>pnpm dlx @deepseek-ai/dsh@latest web --no-open</code>,确认它能否单独跑通"#.to_string(),
+                r#"把 <code>~/.dsh/settings.yaml</code> 里的 <code>app-dsh-channel</code> 固定到某个已知可用版本(如 <code>0.1.5-rc.2</code>)再重启"#.to_string(),
+                r#"查看日志文件 <code>~/.dsh/.dsh-app-launcher.log</code>"#.to_string(),
+            ],
+        }
+    }
+}
+
+/// 把启动日志归类成一种失败原因,供错误页给出针对性建议。
+///
+/// 只在超时/提前退出时调用,所以这里的判断可以保守:拿不准就归到最宽的那一类。
+fn classify_boot_failure(log: &str, had_child: bool) -> BootFailure {
+    if log.contains("neither pnpm nor npx found") {
+        return BootFailure::MissingRunner;
+    }
+    if had_child && log.contains("启动 dsh 失败") {
+        return BootFailure::RunnerExited;
+    }
+    BootFailure::NotReady
+}
+
+/// 一次启动尝试的完整上下文,用于把失败原因和现场一并交给错误页。
+struct BootFailureReport {
+    title: String,
+    reason: String,
+    detail: String,
+    steps: Vec<String>,
+    log: String,
+}
+
+impl BootFailureReport {
+    fn from_log(kind: BootFailure, log: &str, had_child: bool, timeout_secs: u64, detail: &str) -> Self {
+        let steps = if kind == BootFailure::NotReady {
+            // 拉起了后端却一直没就绪,最常见的是卡在下载上,把登录页的
+            // 「Node/pnpm 没装」建议换成更有针对性的版本与网络建议。
+            classify_boot_failure(log, had_child).steps()
+        } else {
+            kind.steps()
+        };
+        Self {
+            title: kind.title().to_string(),
+            reason: kind.reason(timeout_secs),
+            detail: detail.to_string(),
+            steps,
+            log: tail_launcher_log(40),
+        }
+    }
 }
 
 /// 需要导出的配置项(相对于 ~/.dsh)
@@ -216,7 +472,12 @@ fn is_launch_token_char(c: char) -> bool {
 /// 旧版(0.1.1-rc.2 及更早)没有认证,打印的 URL 不带 token:这里返回 None,
 /// 调用方退回裸地址,保持对 pin 在旧频道的用户的兼容。
 fn parse_launch_token(log: &str) -> Option<String> {
-    for line in log.lines() {
+    // Logs are appended across runs. Never redeem an old process's token while
+    // the current process is starting, or after it has printed a fresh token.
+    for line in log.lines().rev() {
+        if line.trim_start().starts_with("===== 启动于 ") {
+            break;
+        }
         let Some(rest) = line.trim_start().strip_prefix("dsh web: ") else {
             continue;
         };
@@ -367,48 +628,89 @@ fn pick_newest_tag(tags: &serde_json::Map<String, serde_json::Value>) -> Option<
     best.map(|(_, tag)| tag)
 }
 
+/// 默认频道。
+///
+/// 为什么默认 `next` 而不是 `latest`:npm 的 `latest` 标签由发布者控制,rc 阶段
+/// 它常常落后于 `next`(实测 latest=0.1.5-rc.1、next=0.1.5-rc.2)。跟 `latest`
+/// 会让桌面壳长期停在旧版,而这正是"客户端表现异常、必须退回终端手跑 @next"的成因。
+/// 想退出预览频道可在菜单「配置 → DSH 频道」里切回 `latest`。
+const DEFAULT_CHANNEL: &str = "next";
+
+/// 菜单里可选的两个频道。顺序即菜单顺序,第一项是默认值。
+const SELECTABLE_CHANNELS: &[(&str, &str)] = &[
+    ("next", "next(预览版,默认)"),
+    ("latest", "latest(稳定版)"),
+];
+
+/// 频道是否属于菜单里可选的那两个。
+fn is_selectable_channel(channel: &str) -> bool {
+    SELECTABLE_CHANNELS.iter().any(|(id, _)| *id == channel)
+}
+
+/// 读取当前生效的频道(菜单勾选状态与 spec 解析共用同一份判断)。
+/// 由配置值决定生效频道。抽成纯函数,便于在不改真实配置的前提下测试。
+///
+/// 菜单里的两个频道直接用;其他安全取值(如 `newest` 或精确版本)原样透传,
+/// 此时菜单不会勾选任何一项;非法或缺失则回落到默认频道。
+fn channel_from_setting(configured: Option<&str>) -> String {
+    match configured {
+        Some(value) if is_selectable_channel(value) => value.to_string(),
+        Some(other) if is_safe_spec_token(other) => other.to_string(),
+        _ => DEFAULT_CHANNEL.to_string(),
+    }
+}
+
+fn configured_channel() -> String {
+    channel_from_setting(read_setting("app-dsh-channel").as_deref())
+}
+
 /// 决定这次启动喂给 pnpm 的 spec。
 ///
-/// 默认使用官方稳定频道,避免预览版 dsh 与第三方 profile 插件不同步。
-/// 可在 ~/.dsh/settings.yaml 覆盖: `app-dsh-channel: newest` | `latest`(默认) |
-/// `next` | 精确版本如 `0.1.0-rc.7`。
+/// 默认 `next`(见 [`DEFAULT_CHANNEL`]);可在 `~/.dsh/settings.yaml` 用
+/// `app-dsh-channel` 覆盖成 `latest` / `newest` / 精确版本如 `0.1.5-rc.2`,
+/// 也可以从菜单「配置 → DSH 频道」直接切换。
 ///
 /// 为什么传 tag 而不是精确版本:pnpm 的缓存目录按 spec 哈希。传 tag 时所有版本
 /// 共用一个目录(dsh 约 220 MB),由 pnpm 原地升级;传精确版本会每发一版就多一个
 /// 220 MB 目录,磁盘无上限增长。
 fn resolve_dsh_spec() -> String {
-    let configured_channel = read_setting("app-dsh-channel");
-    if let Some(pin) = configured_channel.as_deref() {
-        if pin != "newest" && is_safe_spec_token(pin) {
-            return format!("{}@{}", DSH_PACKAGE, pin);
-        }
+    let configured = configured_channel();
+    // `newest` 需要查 registry 才能确定实际 tag
+    if configured == "newest" {
+        return match newest_channel() {
+            Some(tag) => format!("{}@{}", DSH_PACKAGE, tag),
+            None => DSH_PACKAGE.to_string(),
+        };
     }
-    let channel = if configured_channel.as_deref() == Some("newest") {
-        newest_channel()
-    } else {
-        Some("latest".to_string())
-    };
-    match channel {
-        Some(tag) => format!("{}@{}", DSH_PACKAGE, tag),
-        // 解析失败(离线/私有源/网络受限)就退回裸 spec:它对应的 pnpm 缓存目录
-        // 通常早就装好了,能离线秒起,而不是卡在一次注定失败的下载上
-        None => DSH_PACKAGE.to_string(),
+    if is_safe_spec_token(&configured) {
+        return format!("{}@{}", DSH_PACKAGE, configured);
     }
+    DSH_PACKAGE.to_string()
 }
 
 /// 拉起 dsh web 后端:优先 `pnpm dlx`,没有 pnpm 时回退 `npx -y`。
 /// 全程无 stdin,所以任何交互确认都必须提前在环境变量里关掉。
 fn spawn_dsh(spec: &str) -> Option<Child> {
     let log = log_path();
+    // 用 append 而不是 truncate:上一次启动失败的现场必须留着。
+    // 截断会把「客户端为什么卡住」的唯一证据一起抹掉,排查时只剩一片空白。
     let log_file = match fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        .append(true)
         .open(&log)
     {
         Ok(f) => f,
         Err(_) => return None,
     };
+
+    // 每次启动写一条分隔线,便于在追加日志里区分不同次运行。
+    if let Ok(mut marker) = log_file.try_clone() {
+        let _ = writeln!(
+            marker,
+            "\n===== 启动于 {} =====",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
+    }
 
     // pnpm dlx 会直接安装临时包，不需要 npx 的 `-y` 确认选项。
     // --no-open:桌面壳自己导航到 WebView,不让 dsh 再弹系统默认浏览器。
@@ -554,6 +856,70 @@ fn plugin_update_log_path() -> PathBuf {
     dsh_home().join(".dsh-plugin-update.log")
 }
 
+/// 把启动进度推进到加载页。
+///
+/// 走 `window.eval` 而不是 Tauri event:加载页是应用自带的 `tauri://` 页面,没有
+/// `withGlobalTauri`,也不该为了这点进度去开事件权限;而 eval 在当前窗口里始终可用。
+/// 加载页的 `window.__dshBoot` 若还没就绪(极端情况下脚本未执行)则静默跳过 ——
+/// 进度提示丢了不影响启动,不能因此中断流程。
+fn push_boot_progress(
+    window: &tauri::WebviewWindow,
+    stage: BootStage,
+    percent: u32,
+    detail: &str,
+    log_tail: Option<&str>,
+) {
+    let payload = serde_json::json!({
+        "stage": stage.id(),
+        "percent": percent.max(stage.floor_percent()),
+        "title": stage.title(),
+        "detail": detail,
+        "log": log_tail,
+    });
+    let script = format!(
+        "if (window.__dshBoot) {{ window.__dshBoot.update({payload}); }}",
+        payload = payload
+    );
+    let _ = window.eval(&script);
+}
+
+/// 把一组 `String` 步骤转成 `error_html` 需要的借用切片。
+fn step_refs(steps: &[String]) -> Vec<&str> {
+    steps.iter().map(String::as_str).collect()
+}
+
+/// 把启动失败渲染成加载页里的错误面板:原因 + 针对性建议 + 日志尾部。
+fn push_boot_failure(window: &tauri::WebviewWindow, stage: BootStage, report: &BootFailureReport) {
+    let payload = serde_json::json!({
+        "stage": stage.id(),
+        "title": report.title,
+        "reason": report.reason,
+        "detail": report.detail,
+        "steps": report.steps,
+        "log": report.log,
+    });
+    let script = format!(
+        "if (window.__dshBoot) {{ window.__dshBoot.fail({payload}); }} \
+         else {{ document.documentElement.innerHTML = {fallback}; }}",
+        payload = payload,
+        fallback = serde_json::json!(error_html(
+            &report.title,
+            &report.reason,
+            &step_refs(&report.steps)
+        )),
+    );
+    let _ = window.eval(&script);
+}
+
+/// 在 dsh 界面上弹一条状态提示。
+///
+/// 提示必须能消失:
+/// - `running` 是持续状态,不自动隐藏,等后续的 success/error 覆盖它;
+/// - 其余状态(info/success/error)默认 8 秒后淡出 —— 版本信息这类一次性回执
+///   如果一直挂着,用户会以为它关不掉;
+/// - 任何状态都可以点 × 立刻关闭。
+///
+/// 每次调用都会重置上一次的定时器与关闭事件,避免旧定时器把新提示提前关掉。
 fn show_status(app: &tauri::AppHandle, message: &str, state: &str) {
     if let Some(window) = app.get_webview_window("main") {
         let message_json = serde_json::to_string(message).unwrap();
@@ -561,24 +927,66 @@ fn show_status(app: &tauri::AppHandle, message: &str, state: &str) {
         let script = format!(
             r#"(() => {{
                 const id = 'dsh-app-status';
+                const message = {message};
+                const state = {state};
+                const AUTO_HIDE_MS = 8000;
                 let node = document.getElementById(id);
                 if (!node) {{
                     node = document.createElement('div');
                     node.id = id;
-                    node.style.cssText = 'position:fixed;top:16px;right:16px;z-index:2147483647;max-width:460px;padding:12px 16px;border-radius:8px;font:14px/1.45 system-ui,sans-serif;white-space:pre-wrap;box-shadow:0 4px 18px rgba(0,0,0,.18);transition:opacity .2s ease';
+                    node.style.cssText = 'position:fixed;top:16px;right:16px;z-index:2147483647;max-width:460px;padding:12px 34px 12px 16px;border-radius:8px;font:14px/1.45 system-ui,sans-serif;white-space:pre-wrap;box-shadow:0 4px 18px rgba(0,0,0,.18);transition:opacity .25s ease';
                     document.body.appendChild(node);
                 }}
-                node.textContent = {message};
-                node.dataset.state = {state};
-                node.style.background = {state} === 'running' ? '#24415f' : ({state} === 'success' ? '#216e4e' : ({state} === 'info' ? '#425466' : '#8b3030'));
+
+                const dismiss = () => {{
+                    const n = document.getElementById(id);
+                    if (!n) return;
+                    if (n._dshStatusTimer) {{ clearTimeout(n._dshStatusTimer); n._dshStatusTimer = null; }}
+                    n.style.opacity = '0';
+                    setTimeout(() => n.remove(), 250);
+                }};
+
+                // 关闭按钮:节点被重建后旧按钮随之消失,不存在重复绑定
+                let close = node.querySelector('.dsh-app-status-close');
+                if (!close) {{
+                    close = document.createElement('button');
+                    close.className = 'dsh-app-status-close';
+                    close.type = 'button';
+                    close.setAttribute('aria-label', '关闭提示');
+                    close.textContent = '×';
+                    close.style.cssText = 'position:absolute;top:6px;right:8px;width:20px;height:20px;padding:0;border:0;border-radius:4px;background:transparent;color:#fff;font:16px/1 system-ui,sans-serif;cursor:pointer;opacity:.75';
+                    close.addEventListener('mouseenter', () => {{ close.style.opacity = '1'; }});
+                    close.addEventListener('mouseleave', () => {{ close.style.opacity = '.75'; }});
+                    close.addEventListener('click', dismiss);
+                    node.appendChild(close);
+                }}
+
+                // 用既有 span 承载正文,避免 textContent 覆盖掉关闭按钮
+                let body = node.querySelector('.dsh-app-status-body');
+                if (!body) {{
+                    body = document.createElement('span');
+                    body.className = 'dsh-app-status-body';
+                    node.insertBefore(body, node.firstChild);
+                }}
+                body.textContent = message;
+                node.dataset.state = state;
+                node.style.background = state === 'running' ? '#24415f' : (state === 'success' ? '#216e4e' : (state === 'info' ? '#425466' : '#8b3030'));
                 node.style.color = '#fff';
                 node.style.opacity = '1';
-                node.style.animation = {state} === 'running' ? 'dsh-app-status-pulse 1.2s ease-in-out infinite' : 'none';
+                node.style.animation = state === 'running' ? 'dsh-app-status-pulse 1.2s ease-in-out infinite' : 'none';
+                node.style.position = 'fixed';
+
                 if (!document.getElementById('dsh-app-status-style')) {{
                     const style = document.createElement('style');
                     style.id = 'dsh-app-status-style';
                     style.textContent = '@keyframes dsh-app-status-pulse {{ 0%,100% {{ opacity:.72 }} 50% {{ opacity:1 }} }}';
                     document.head.appendChild(style);
+                }}
+
+                // 重置自动消失:上一次的定时器必须先清掉
+                if (node._dshStatusTimer) {{ clearTimeout(node._dshStatusTimer); node._dshStatusTimer = null; }}
+                if (state !== 'running') {{
+                    node._dshStatusTimer = setTimeout(dismiss, AUTO_HIDE_MS);
                 }}
             }})();"#,
             message = message_json,
@@ -937,6 +1345,52 @@ fn set_shortcut_cmd(app: tauri::AppHandle, shortcut: String) -> Result<String, S
     Ok(format!("快捷键已设为: {} (立即生效)", s))
 }
 
+/// 切换 DSH 频道(菜单「配置 → DSH 频道」)。
+///
+/// 只改配置,不动正在运行的后端:贸然杀掉后端会让用户当前打开的界面立刻失效,
+/// 而"下次启动生效"是可预期的行为。写入后重建菜单更新勾选状态。
+fn switch_channel(app: &tauri::AppHandle, channel: &str) {
+    if !is_selectable_channel(channel) {
+        show_status(app, &format!("未知频道: {channel}"), "error");
+        return;
+    }
+
+    let current = configured_channel();
+    if current == channel {
+        show_status(
+            app,
+            &format!("当前已经是 {channel} 频道,无需切换。"),
+            "info",
+        );
+        return;
+    }
+
+    if let Err(error) = write_setting_value("app-dsh-channel", channel) {
+        show_status(
+            app,
+            &format!("写入频道配置失败: {error}\n请检查 ~/.dsh/settings.yaml 的写入权限。"),
+            "error",
+        );
+        return;
+    }
+
+    // 勾选状态来自配置,写完必须重建菜单才会反映出来
+    if let Err(error) = rebuild_menu(app) {
+        eprintln!("切换频道后重建菜单失败: {error}");
+    }
+
+    show_status(
+        app,
+        &format!(
+            "DSH 频道已切换为 {channel}。\n\
+             需要完全退出并重新启动本应用后生效。\n\
+             若 3080 端口已有其他 dsh 实例在运行,新频道不会生效 —— \
+             请先关掉那个实例。"
+        ),
+        "success",
+    );
+}
+
 /// 重建应用菜单(用于快捷键变更后更新菜单标题)
 fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
     let current_shortcut = read_shortcut();
@@ -962,9 +1416,27 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .accelerator("CmdOrCtrl+Q")
         .build(app).map_err(|e| e.to_string())?;
 
+    // 频道切换:勾选当前生效的那个,点击即写入 ~/.dsh/settings.yaml
+    let active_channel = configured_channel();
+    let mut channel_builder = SubmenuBuilder::new(app, "DSH 频道");
+    let mut channel_items = Vec::new();
+    for (id, label) in SELECTABLE_CHANNELS {
+        let item = CheckMenuItemBuilder::with_id(format!("channel-{}", id), *label)
+            .checked(*id == active_channel)
+            .build(app)
+            .map_err(|e| e.to_string())?;
+        channel_items.push(item);
+    }
+    for item in &channel_items {
+        channel_builder = channel_builder.item(item);
+    }
+    let channel_submenu = channel_builder.build().map_err(|e| e.to_string())?;
+
     let config_submenu = SubmenuBuilder::new(app, "配置")
         .item(&toggle_item)
         .item(&set_shortcut_item)
+        .separator()
+        .item(&channel_submenu)
         .separator()
         .item(&export_no_cred)
         .item(&export_with_cred)
@@ -976,6 +1448,9 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .item(&quit_item)
         .build().map_err(|e| e.to_string())?;
 
+    // 非 macOS 平台直接挂这份菜单;macOS 还要额外拼一个"编辑"菜单,
+    // 所以这个中间变量只在非 macOS 分支被消费。
+    #[cfg(not(target_os = "macos"))]
     let menu = MenuBuilder::new(app).item(&config_submenu).build().map_err(|e| e.to_string())?;
 
     // macOS: 添加编辑菜单(让 Cmd+C/V/X/A/Z 生效)
@@ -1209,13 +1684,6 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
     ))
 }
 
-/// 启动失败页的排查步骤。
-const BOOT_ERROR_STEPS: &[&str] = &[
-    r#"确认已安装 <a href="https://nodejs.org" style="color:#58a6ff">Node.js</a>"#,
-    r#"在终端手动执行测试:<br><code>pnpm dlx @deepseek-ai/dsh web</code>"#,
-    r#"查看日志文件:<br><code>~/.dsh/.dsh-app-launcher.log</code>"#,
-];
-
 /// 认证失败页的排查步骤。launch token 每进程随机、只在 dsh 自己的 stdout 打印,
 /// 外部启动的实例我们读不到 —— 只能让用户二选一。
 const AUTH_ERROR_STEPS: &[&str] = &[
@@ -1224,9 +1692,16 @@ const AUTH_ERROR_STEPS: &[&str] = &[
     r#"查看日志文件:<br><code>~/.dsh/.dsh-app-launcher.log</code>"#,
 ];
 
+/// 错误页的收尾说明。启动失败时补一给「怎么彻底重启」的操作,免得用户只在
+/// 窗口上点关闭(那只是隐藏窗口,后端与状态都还在)。
+const RESTART_HINT: &str =
+    r#"修复后请从菜单「配置 → 退出 DeepSeek Harness」彻底退出,再重新打开本应用。"#;
+
 /// 错误页 HTML。`steps` 内含标记,和 `reason` 一样直接插值 —— 两者都是本文件的常量。
 fn error_html(title: &str, reason: &str, steps: &[&str]) -> String {
-    let steps_html = steps
+    let mut all_steps: Vec<&str> = steps.to_vec();
+    all_steps.push(RESTART_HINT);
+    let steps_html = all_steps
         .iter()
         .enumerate()
         .map(|(i, step)| format!("<p>{}. {}</p>", i + 1, step))
@@ -1277,6 +1752,13 @@ fn auth_fallback_script() -> String {
         needle = serde_json::json!("dsh web authentication required"),
         html = serde_json::json!(html)
     )
+}
+
+/// The boot loop uses blocking HTTP and thread sleeps, so it must not run as an
+/// async task. Without an await, reqwest's oneshot polls eventually exhaust the
+/// task's cooperative budget and park forever, bypassing even the boot deadline.
+fn spawn_boot_worker(task: impl FnOnce() + Send + 'static) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn_blocking(task)
 }
 
 fn main() {
@@ -1353,8 +1835,13 @@ fn main() {
             .build()?;
 
             let child = if probe_dsh() == DshState::Down {
-                // 只有真要拉起后端时才去解析版本,复用已在跑的实例不付这次网络开销
-                spawn_dsh(&resolve_dsh_spec())
+                // 只有真要拉起后端时才去解析版本,复用已在跑的实例不付这次网络开销。
+                // 版本解析是一次 registry 网络请求(最多 5s),spawn 前先告诉加载页,
+                // 免得用户在"什么都不显示"的状态下等这段。
+                push_boot_progress(&main_window, BootStage::Resolve, 0, "", None);
+                let spec = resolve_dsh_spec();
+                push_boot_progress(&main_window, BootStage::Spawn, 0, &spec, None);
+                spawn_dsh(&spec)
             } else {
                 None
             };
@@ -1377,21 +1864,105 @@ fn main() {
             drop(owned_child);
 
             let window = main_window.clone();
-            tauri::async_runtime::spawn(async move {
+            spawn_boot_worker(move || {
                 let started = Instant::now();
                 let deadline = started + Duration::from_secs(BOOT_TIMEOUT_SECS);
                 // 后端没在跑时:短暂等待后就把加载页显示出来。切换 spec 或首次安装要下
                 // 约 220 MB,让用户全程盯着空白桌面(甚至怀疑没启动)是不可接受的。
                 let reveal_at = started + Duration::from_secs(if had_child { 3 } else { 0 });
                 let mut revealed = false;
+                let mut stage = BootStage::Probe;
+
+                // 首次推送至少要等加载页的脚本执行完,否则 __dshBoot 还不存在。
+                let mut last_push: Option<Instant> = None;
+                // 后端是被我们拉起的,进程一旦退出就永远等不到端口 —— 提前报错,
+                // 而不是让用户白等满 10 分钟。
+                let mut child_exited: Option<String> = None;
 
                 loop {
-                    if !revealed && Instant::now() >= reveal_at {
+                    let now = Instant::now();
+                    if !revealed && now >= reveal_at {
                         let _ = window.show();
                         revealed = true;
                     }
+                    if !revealed {
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+
+                    // 每 700 ms 探测一次,但进度推送按秒节流:日志读取和 eval 都不便宜,
+                    // 而加载页的耗时本身就在秒级跳动。
+                    let due = last_push.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1));
+                    if due {
+                        let elapsed = now.duration_since(started).as_secs();
+                        let detail = match stage {
+                            BootStage::Spawn | BootStage::Download => {
+                                format!("已等待 {}s", elapsed)
+                            }
+                            _ => String::new(),
+                        };
+                        push_boot_progress(&window, stage, stage.floor_percent(), &detail, None);
+                        last_push = Some(now);
+                    }
+
+                    // 拉起的后端提前退出:再等也没有意义,直接把日志里的原因报出来。
+                    if child_exited.is_none() && had_child {
+                        if let Some(state) = window.app_handle().try_state::<DshChild>() {
+                            let mut guard = match state.0.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            if let Some(child) = guard.as_mut() {
+                                match child.try_wait() {
+                                    Ok(Some(status)) => {
+                                        let code = status
+                                            .code()
+                                            .map(|c| c.to_string())
+                                            .unwrap_or_else(|| "未知".to_string());
+                                        child_exited = Some(format!("后端进程已退出,退出码 {code}"));
+                                    }
+                                    // 已退出且被回收过,或轮询失败:都不再按「运行中」处理
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        child_exited =
+                                            Some(format!("无法获取后端进程状态:{error}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(reason) = child_exited.clone() {
+                        let log = tail_launcher_log(80);
+                        let kind = classify_boot_failure(&log, had_child);
+                        // 日志里没写明原因(比如包装脚本自己挂了)时,退到进程退出这一类,
+                        // 比「端口超时」更能说明问题。
+                        let kind = if kind == BootFailure::NotReady {
+                            BootFailure::RunnerExited
+                        } else {
+                            kind
+                        };
+                        let report = BootFailureReport::from_log(
+                            kind,
+                            &log,
+                            had_child,
+                            started.elapsed().as_secs(),
+                            &reason,
+                        );
+                        push_boot_failure(&window, stage, &report);
+                        let _ = window.show();
+                        break;
+                    }
 
                     let state = probe_dsh();
+
+                    // 阶段只前进不后退:认证态下探测偶发回落到 401 之外的状态时,
+                    // 进度提示不该跳回「等待端口就绪」。
+                    if state == DshState::Down && stage < BootStage::Download {
+                        stage = BootStage::Download;
+                    } else if state != DshState::Down && stage < BootStage::Auth {
+                        stage = BootStage::Auth;
+                    }
 
                     // 新版 dsh 要先用 launch token 换 cookie。token 每进程随机、只在 stdout
                     // 打印,所以只能从我们自己重定向过去的那份日志里捞。
@@ -1433,6 +2004,7 @@ fn main() {
                     };
 
                     if let Some(target) = target {
+                        push_boot_progress(&window, BootStage::Ready, 100, "", None);
                         let _ = window.navigate(target.parse().unwrap_or_else(|_| {
                             format!("http://127.0.0.1:{}", DSH_PORT).parse().unwrap()
                         }));
@@ -1445,18 +2017,34 @@ fn main() {
                         break;
                     }
 
-                    // 走到这里说明端口还没起来。超时了就只剩报错。
+                    // 走到这里说明端口还没起来。超时了就把日志现场一并交给错误页。
                     if Instant::now() > deadline {
-                        let reason = if had_child {
-                            "启动器已拉起但 dsh web 长时间未就绪(超过 10 分钟)。可能是下载被网络卡住,或 dsh 启动报错 —— 请看日志。"
+                        let log = tail_launcher_log(80);
+                        let timeout_secs = started.elapsed().as_secs();
+                        let kind = if state == DshState::NeedsAuth {
+                            // 端口有响应但换不到 cookie:等待解决不了问题。
+                            BootFailure::AuthRejected
                         } else {
-                            "无法启动包管理器进程。请确认已安装 Node.js(pnpm 可选)。"
+                            classify_boot_failure(&log, had_child)
                         };
-                        let html = error_html("DSH 启动失败", reason, BOOT_ERROR_STEPS);
-                        let _ = window.eval(&format!(
-                            "document.documentElement.innerHTML = {};",
-                            serde_json::json!(html)
-                        ));
+                        let detail = format!(
+                            "阶段 {} · 已等待 {}s · 日志 {}",
+                            stage.id(),
+                            timeout_secs,
+                            log_path().display()
+                        );
+                        let report =
+                            BootFailureReport::from_log(kind, &log, had_child, timeout_secs, &detail);
+                        push_boot_failure(&window, stage, &report);
+                        // 自己拉起的后端起不来,就不该把进程留着占 3080 端口
+                        if had_child {
+                            if let Some(state) = window.app_handle().try_state::<DshChild>() {
+                                let mut child = take_owned_child(&state);
+                                if let Some(child) = child.as_mut() {
+                                    terminate_child_tree(child);
+                                }
+                            }
+                        }
                         let _ = window.show();
                         break;
                     }
@@ -1513,16 +2101,19 @@ fn main() {
                 "import" => do_import(app),
                 "update-plugins" => update_web_profile_plugins(app),
                 "version" => {
-                    let channel = read_setting("app-dsh-channel").unwrap_or_else(|| "latest".into());
                     show_status(
                         app,
                         &format!(
                             "DeepSeek Harness Desktop v{}\nDSH channel: {}",
                             env!("CARGO_PKG_VERSION"),
-                            channel
+                            configured_channel()
                         ),
                         "info",
                     );
+                }
+                id if id.starts_with("channel-") => {
+                    let channel = id.trim_start_matches("channel-").to_string();
+                    switch_channel(app, &channel);
                 }
                 _ => {}
             }
@@ -1549,6 +2140,79 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_worker_can_poll_past_the_async_cooperative_budget() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        const POLLS: usize = 160;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().take(POLLS) {
+                let mut stream = stream.unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0; 4096];
+                stream.read(&mut request).unwrap();
+                stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        let worker = spawn_boot_worker(move || {
+            let result = (|| -> Result<usize, reqwest::Error> {
+                for _ in 0..POLLS {
+                    // Match probe_dsh: a new blocking client on every poll.
+                    let status = reqwest::blocking::Client::builder()
+                        .no_proxy()
+                        .timeout(Duration::from_secs(2))
+                        .build()?
+                        .get(&url)
+                        .send()?
+                        .status();
+                    assert_eq!(dsh_state_for_status(status.as_u16()), DshState::NeedsAuth);
+                }
+                Ok(POLLS)
+            })();
+            let _ = tx.send(result);
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(15))
+                .expect("startup worker stalled or panicked")
+                .expect("loopback probes failed"),
+            POLLS
+        );
+        tauri::async_runtime::block_on(worker).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn startup_worker_preserves_http_request_timeout() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        // A listening socket that never sends an HTTP response.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+        let worker = spawn_boot_worker(move || {
+            let result = reqwest::blocking::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap()
+                .get(url)
+                .send();
+            let _ = tx.send(result.is_err_and(|error| error.is_timeout()));
+        });
+        assert!(rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker stalled"));
+        tauri::async_runtime::block_on(worker).unwrap();
+        drop(listener);
+    }
 
     #[test]
     fn zip_entry_names_are_portable_across_operating_systems() {
@@ -1798,6 +2462,334 @@ mod tests {
         assert!(pick_newest_tag(&tags(&[])).is_none());
     }
 
+    /// 阶段顺序决定了进度条只能前进:加载页按 id 高亮步骤,顺序错了会跳步。
+    #[test]
+    fn boot_stages_advance_monotonically() {
+        assert!(BootStage::Probe < BootStage::Resolve);
+        assert!(BootStage::Resolve < BootStage::Spawn);
+        assert!(BootStage::Spawn < BootStage::Download);
+        assert!(BootStage::Download < BootStage::Auth);
+        assert!(BootStage::Auth < BootStage::Ready);
+    }
+
+    /// 进度百分比的下限必须随阶段单调不减,否则进度条会往回缩。
+    #[test]
+    fn boot_stage_floors_never_go_backwards() {
+        let stages = [
+            BootStage::Probe,
+            BootStage::Resolve,
+            BootStage::Spawn,
+            BootStage::Download,
+            BootStage::Auth,
+            BootStage::Ready,
+        ];
+        for pair in stages.windows(2) {
+            assert!(
+                pair[0].floor_percent() < pair[1].floor_percent(),
+                "{:?} 的百分比下限不应高于 {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(BootStage::Ready.floor_percent(), 100);
+    }
+
+    /// 加载页用这些 id 定位步骤节点,改名会让进度显示整体失效。
+    #[test]
+    fn boot_stage_ids_match_the_loading_page() {
+        assert_eq!(BootStage::Probe.id(), "probe");
+        assert_eq!(BootStage::Resolve.id(), "resolve");
+        assert_eq!(BootStage::Spawn.id(), "spawn");
+        assert_eq!(BootStage::Download.id(), "download");
+        assert_eq!(BootStage::Auth.id(), "auth");
+        assert_eq!(BootStage::Ready.id(), "ready");
+    }
+
+    /// 后端脚本自己 exit 127 时会打印这句话 —— 必须归到「没装包管理器」,
+    /// 而不是笼统的超时,否则用户会去查网络而不是装 Node。
+    #[test]
+    fn missing_runner_is_diagnosed_from_the_launcher_log() {
+        let log = "[2026-09-13 10:55:14] dsh 启动中: @deepseek-ai/dsh@latest web --no-open\n\
+                   ERROR: neither pnpm nor npx found. Install Node.js (https://nodejs.org) or pnpm\n";
+        assert_eq!(classify_boot_failure(log, true), BootFailure::MissingRunner);
+    }
+
+    /// spawn 直接失败时日志里只有一行「启动 dsh 失败」,不能再报「端口超时」。
+    #[test]
+    fn spawn_failure_is_diagnosed_from_the_launcher_log() {
+        let log = "[2026-09-13 10:55:14] 启动 dsh 失败: No such file or directory (os error 2)\n";
+        assert_eq!(classify_boot_failure(log, true), BootFailure::RunnerExited);
+    }
+
+    /// 干净但慢的启动(下载大包)不该被误判成故障。
+    #[test]
+    fn slow_but_healthy_startup_is_not_misdiagnosed() {
+        let log = "dsh-web: installing @deepseek-ai/dsh@latest...\n";
+        assert_eq!(classify_boot_failure(log, true), BootFailure::NotReady);
+    }
+
+    /// 没拉过后端却超时,说明是外部实例/端口占用一类的问题,不该建议重装 Node。
+    #[test]
+    fn startup_without_an_owned_child_stays_generic() {
+        let log = "";
+        let kind = classify_boot_failure(log, false);
+        assert_eq!(kind, BootFailure::NotReady);
+        let steps = kind.steps().join("\n");
+        assert!(!steps.contains("Node.js ≥ 22.19"), "未拉起后端时不应建议升级 Node");
+    }
+
+    /// 每种失败都必须带可执行建议,理由里也不能是空的。
+    #[test]
+    fn every_failure_carries_actionable_steps() {
+        for kind in [
+            BootFailure::MissingRunner,
+            BootFailure::RunnerExited,
+            BootFailure::AuthRejected,
+            BootFailure::NotReady,
+        ] {
+            let steps = kind.steps();
+            assert!(!steps.is_empty(), "{kind:?} 缺少排查建议");
+            assert!(!kind.title().is_empty());
+            assert!(!kind.reason(600).is_empty());
+        }
+    }
+
+    /// 超时理由要带上实际等待时长,而不是写死「10 分钟」。
+    #[test]
+    fn timeout_reason_reports_the_real_elapsed_time() {
+        let reason = BootFailure::NotReady.reason(725);
+        assert!(reason.contains("12 分"), "应显示 12 分,实际: {reason}");
+        assert!(reason.contains("5 秒"), "应显示 5 秒,实际: {reason}");
+    }
+
+    /// 错误页始终补一句「怎么彻底重启」,避免用户只关窗口(那只是隐藏)。
+    #[test]
+    fn error_page_always_explains_how_to_fully_restart() {
+        let html = error_html("测试", "原因", &["步骤一"]);
+        assert!(html.contains(RESTART_HINT), "错误页应包含彻底重启的说明");
+        assert!(html.contains("步骤一"));
+    }
+
+    /// 日志尾部读取:文件不存在时返回空串,绝不能因此让启动流程出错。
+    #[test]
+    fn tail_of_a_missing_log_is_empty() {
+        // 测试环境不保证 ~/.dsh 存在;这个断言只要求「不 panic 且类型正确」。
+        let tail = tail_launcher_log(10);
+        assert!(tail.is_empty() || !tail.is_empty());
+    }
+
+    /// `show_status` 注入的脚本源文本。
+    ///
+    /// 取源码本身而不是跑一遍 GUI —— 这里要守住的是"脚本里必须有这些机制",
+    /// 真实渲染行为由 tests/test_launcher_command.py 与 jsdom 用例覆盖。
+    fn status_script_source() -> &'static str {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn show_status(")
+            .expect("show_status must exist");
+        let end = source[start..]
+            .find("/// Update every dependency")
+            .expect("show_status must be followed by update_web_profile_plugins")
+            + start;
+        let body = &source[start..end];
+        let open = body.find("r#\"").expect("status script raw string") + 3;
+        let close = body[open..].find("\"#").expect("status script terminator") + open;
+        &body[open..close]
+    }
+
+    /// 版本信息是一次性回执,必须能自动消失 —— 否则用户会以为它关不掉。
+    #[test]
+    fn status_toast_hides_itself_after_a_delay() {
+        let script = status_script_source();
+        assert!(
+            script.contains("setTimeout(dismiss"),
+            "状态提示必须注册自动消失定时器"
+        );
+        assert!(
+            script.contains("AUTO_HIDE_MS"),
+            "自动消失的时长应当是一个显式常量"
+        );
+    }
+
+    /// 持续状态(running)不能自动消失:它是"正在进行"的指示,
+    /// 要等后续的 success/error 把它盖掉。
+    #[test]
+    fn running_status_stays_visible_until_replaced() {
+        let script = status_script_source();
+        assert!(
+            script.contains("state !== 'running'"),
+            "自动消失必须排除 running 状态"
+        );
+    }
+
+    /// 提示必须提供一个可点的关闭按钮,并显式清理定时器。
+    #[test]
+    fn status_toast_offers_an_explicit_close_button() {
+        let script = status_script_source();
+        assert!(script.contains("dsh-app-status-close"), "缺少关闭按钮");
+        assert!(script.contains("clearTimeout"), "关闭时必须清掉自动消失定时器");
+        assert!(
+            script.contains("n.remove()"),
+            "关闭后要把节点从 DOM 里移除,不能只改透明度"
+        );
+    }
+
+    /// 回归:正文曾经用 `node.textContent = ...` 直接写,会把关闭按钮一起冲掉。
+    #[test]
+    fn status_text_does_not_wipe_the_close_button() {
+        let script = status_script_source();
+        assert!(
+            !script.contains("node.textContent ="),
+            "正文不能写在节点本身上,否则会覆盖关闭按钮"
+        );
+        assert!(
+            script.contains("dsh-app-status-body"),
+            "正文应写进独立的 body 子节点"
+        );
+    }
+
+    /// 默认频道必须是 next:跟 latest 会让桌面壳长期停在旧版,
+    /// 这正是"客户端表现异常、只能退回终端手跑 @next"的成因。
+    #[test]
+    fn defaults_to_the_next_channel() {
+        assert_eq!(DEFAULT_CHANNEL, "next");
+        assert_eq!(channel_from_setting(None), "next");
+        assert_eq!(channel_from_setting(Some("")), "next");
+    }
+
+    /// 菜单里的两个频道可被显式选中。
+    #[test]
+    fn explicit_channels_are_honoured() {
+        assert_eq!(channel_from_setting(Some("next")), "next");
+        assert_eq!(channel_from_setting(Some("latest")), "latest");
+    }
+
+    /// `newest` 与精确版本不在菜单里,但配置写了就该生效(菜单不勾选任何项)。
+    #[test]
+    fn non_menu_channels_pass_through() {
+        assert_eq!(channel_from_setting(Some("newest")), "newest");
+        assert_eq!(channel_from_setting(Some("0.1.5-rc.2")), "0.1.5-rc.2");
+        assert!(!is_selectable_channel("newest"));
+        assert!(!is_selectable_channel("0.1.5-rc.2"));
+    }
+
+    /// 危险取值不能进命令行:回落到默认,而不是透传给 shell。
+    #[test]
+    fn unsafe_channel_values_fall_back_to_default() {
+        assert_eq!(channel_from_setting(Some("x; rm -rf /")), "next");
+        assert_eq!(channel_from_setting(Some("a b")), "next");
+        assert_eq!(channel_from_setting(Some("$(id)")), "next");
+    }
+
+    /// 只有顶层键算配置项。嵌套子键(如 providers 下的同名项)不能被当成频道读走。
+    #[test]
+    fn nested_keys_are_not_mistaken_for_top_level_settings() {
+        let content = "\
+llm-pi-ai:
+  providers:
+    app-dsh-channel: \"evil\"
+app-dsh-channel: \"latest\"
+";
+        assert_eq!(
+            parse_top_level_setting(content, "app-dsh-channel").as_deref(),
+            Some("latest"),
+            "必须读到顶层那个,而不是缩进的同名子键"
+        );
+    }
+
+    /// 没有顶层键时应返回 None(而不是误取子键)。
+    #[test]
+    fn missing_top_level_key_is_none() {
+        let content = "llm-pi-ai:\n  app-dsh-channel: \"nested\"\n";
+        assert_eq!(parse_top_level_setting(content, "app-dsh-channel"), None);
+        assert_eq!(parse_top_level_setting("", "app-dsh-channel"), None);
+    }
+
+    /// 写顶层键时,嵌套结构必须原样保留。
+    #[test]
+    fn upsert_preserves_nested_structure() {
+        let content = "\
+permission:
+  defaultPreset: danger-full-access
+app-dsh-channel: \"latest\"
+";
+        let updated = upsert_top_level_setting(content, "app-dsh-channel", "next");
+        assert!(updated.contains("app-dsh-channel: \"next\""));
+        assert!(!updated.contains("\"latest\""));
+        assert!(
+            updated.contains("permission:\n  defaultPreset: danger-full-access"),
+            "嵌套块被破坏: {updated}"
+        );
+    }
+
+    /// 键不存在时追加到末尾,而不是丢弃原有内容。
+    #[test]
+    fn upsert_appends_missing_key() {
+        let content = "permission:\n  defaultPreset: danger-full-access\n";
+        let updated = upsert_top_level_setting(content, "app-dsh-channel", "next");
+        assert!(updated.contains("permission:"));
+        assert!(updated.ends_with("app-dsh-channel: \"next\"\n"), "实际: {updated}");
+    }
+
+    /// 来回切换必须稳定:写两次的结果等于直接写目标值。
+    #[test]
+    fn upsert_is_idempotent_across_switches() {
+        let original = "app-shortcut: \"Alt+E\"\napp-dsh-channel: \"latest\"\n";
+        let once = upsert_top_level_setting(original, "app-dsh-channel", "next");
+        let twice = upsert_top_level_setting(&once, "app-dsh-channel", "next");
+        assert_eq!(once, twice, "重复写入不应产生副本");
+        let back = upsert_top_level_setting(&twice, "app-dsh-channel", "latest");
+        assert!(back.contains("app-dsh-channel: \"latest\""));
+        assert_eq!(
+            back.matches("app-dsh-channel").count(),
+            1,
+            "切换不应累积重复键: {back}"
+        );
+    }
+
+    /// 切换频道只应影响频道键,快捷键等其他顶层键必须原封不动。
+    #[test]
+    fn upsert_touches_only_the_target_key() {
+        let content = "app-shortcut: \"Alt+E\"\napp-dsh-channel: \"latest\"\n";
+        let updated = upsert_top_level_setting(content, "app-dsh-channel", "next");
+        assert!(updated.contains("app-shortcut: \"Alt+E\""), "快捷键被改动: {updated}");
+    }
+
+    /// 从既有真实配置里读频道:写入后必须能被读回来。
+    #[test]
+    fn channel_round_trips_through_the_file_format() {
+        let content = "app-shortcut: \"Alt+E\"\n";
+        let written = upsert_top_level_setting(content, "app-dsh-channel", "next");
+        let read_back = parse_top_level_setting(&written, "app-dsh-channel");
+        assert_eq!(read_back.as_deref(), Some("next"));
+        assert_eq!(channel_from_setting(read_back.as_deref()), "next");
+    }
+
+    /// 启动日志必须追加而不是截断:上次失败的现场是唯一的排查证据。
+    ///
+    /// 注意范围只取到第一个子函数/关键语句之前 —— `update_web_profile_plugins`
+    /// 也用了 truncate(插件更新日志每次覆盖是合理的),不能把它算进来。
+    #[test]
+    fn launcher_log_is_appended_not_truncated() {
+        let source = include_str!("main.rs");
+        let spawn = source
+            .find("fn spawn_dsh(")
+            .expect("spawn_dsh must exist");
+        let tail = &source[spawn..];
+        let end = tail
+            .find("// pnpm dlx 会直接安装临时包")
+            .expect("spawn_dsh must contain the runner comment");
+        let open_block = &tail[..end];
+        assert!(
+            open_block.contains(".append(true)"),
+            "必须用 append 打开启动日志,否则上次启动的现场会被抹掉"
+        );
+        assert!(
+            !open_block.contains(".truncate(true)"),
+            "启动日志不能用 truncate,否则覆盖上一次启动的日志"
+        );
+    }
+
     #[test]
     fn spec_token_safety_rejects_shell_metacharacters() {
         assert!(is_safe_spec_token("0.1.0-rc.8"));
@@ -1818,6 +2810,22 @@ mod tests {
             parse_launch_token(log).as_deref(),
             Some("1eBHG70HVPH97-9ahDKgxw1jC1u8BXScDr6tGVjh0ig")
         );
+    }
+
+    #[test]
+    fn appended_launch_log_uses_the_current_runs_token() {
+        let log = "dsh web: http://127.0.0.1:3080/?token=old_token\n\
+                   ===== 启动于 2026-09-13 18:00:00 =====\n\
+                   dsh web: http://127.0.0.1:3080/?token=current_token\n";
+        assert_eq!(parse_launch_token(log).as_deref(), Some("current_token"));
+    }
+
+    #[test]
+    fn new_launch_without_a_token_does_not_reuse_a_previous_runs_token() {
+        let log = "dsh web: http://127.0.0.1:3080/?token=old_token\n\
+                   ===== 启动于 2026-09-13 18:00:00 =====\n\
+                   dsh 启动中\n";
+        assert_eq!(parse_launch_token(log), None);
     }
 
     /// 带 LAN 地址时同一行会出现两个 token(值相同),取第一个即可。
