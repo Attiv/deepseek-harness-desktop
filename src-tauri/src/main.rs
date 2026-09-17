@@ -403,6 +403,7 @@ impl BootFailureReport {
 /// 需要导出的配置项(相对于 ~/.dsh)
 const EXPORT_ITEMS: &[&str] = &[
     "settings.yaml",
+    "cordis.patch.yml",
     ".credentials.yaml",
     ".anonymous-user-id",
     "skills",
@@ -415,6 +416,7 @@ const PROFILE_FILES: &[&str] = &[
     "cordis.yml",
     "package.json",
     "pnpm-workspace.yaml",
+    "pnpm-lock.yaml",
 ];
 
 /// dsh web 的就绪状态。
@@ -1484,6 +1486,20 @@ fn close_shortcut_window(app: tauri::AppHandle) {
     }
 }
 
+/// 文件选择器关闭后使用原生回执,不依赖远程页面实现 JavaScript alert。
+fn show_config_result(app: &tauri::AppHandle, operation: &str, result: Result<String, String>) {
+    let (title, message, state, kind) = match result {
+        Ok(message) => (format!("{operation}成功"), message, "success", tauri_plugin_dialog::MessageDialogKind::Info),
+        Err(message) => (format!("{operation}失败"), message, "error", tauri_plugin_dialog::MessageDialogKind::Error),
+    };
+    show_status(app, &message, state);
+    let mut dialog = app.dialog().message(message).title(title).kind(kind);
+    if let Some(window) = app.get_webview_window("main") {
+        dialog = dialog.parent(&window);
+    }
+    dialog.show(|_| {});
+}
+
 /// 导出配置(异步,避免 macOS blocking dialog 死锁)
 fn do_export(app: &tauri::AppHandle, include_credentials: bool) {
     let dsh = dsh_home();
@@ -1491,7 +1507,7 @@ fn do_export(app: &tauri::AppHandle, include_credentials: bool) {
         Some(w) => w,
         None => return,
     };
-    let win = window.clone();
+    let app = app.clone();
 
     window
         .dialog()
@@ -1503,17 +1519,19 @@ fn do_export(app: &tauri::AppHandle, include_credentials: bool) {
             let save_path = match file_path {
                 Some(p) => match p.into_path() {
                     Ok(path) => path,
-                    Err(_) => return,
+                    Err(e) => {
+                        show_config_result(&app, "导出配置", Err(format!("读取保存路径失败: {e}")));
+                        return;
+                    }
                 },
                 None => return,
             };
 
-            let result = build_export_zip(&dsh, &save_path, include_credentials);
-            let msg = match result {
-                Ok(s) => s,
-                Err(e) => format!("错误: {}", e),
-            };
-            let _ = win.eval(&format!("alert({});", serde_json::to_string(&msg).unwrap()));
+            show_status(&app, "正在导出配置，请稍候…", "running");
+            tauri::async_runtime::spawn_blocking(move || {
+                let result = build_export_zip(&dsh, &save_path, include_credentials);
+                show_config_result(&app, "导出配置", result);
+            });
         });
 }
 
@@ -1583,7 +1601,7 @@ fn do_import(app: &tauri::AppHandle) {
         Some(w) => w,
         None => return,
     };
-    let win = window.clone();
+    let app = app.clone();
 
     window
         .dialog()
@@ -1594,17 +1612,19 @@ fn do_import(app: &tauri::AppHandle) {
             let open_path = match file_path {
                 Some(p) => match p.into_path() {
                     Ok(path) => path,
-                    Err(_) => return,
+                    Err(e) => {
+                        show_config_result(&app, "导入配置", Err(format!("读取所选文件路径失败: {e}")));
+                        return;
+                    }
                 },
                 None => return,
             };
 
-            let result = extract_import_zip(&dsh, &open_path);
-            let msg = match result {
-                Ok(s) => s,
-                Err(e) => format!("错误: {}", e),
-            };
-            let _ = win.eval(&format!("alert({});", serde_json::to_string(&msg).unwrap()));
+            show_status(&app, "正在导入配置，请勿退出应用…", "running");
+            tauri::async_runtime::spawn_blocking(move || {
+                let result = extract_import_zip(&dsh, &open_path);
+                show_config_result(&app, "导入配置", result);
+            });
         });
 }
 
@@ -1614,9 +1634,12 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
 
     fs::create_dir_all(dsh).map_err(|e| e.to_string())?;
+    // 所有输出路径从同一个规范化根目录派生,兼容 Windows 的 \\?\ 前缀及目录别名。
+    let canonical_dsh = dsh.canonicalize().map_err(|e| e.to_string())?;
 
     let mut extracted = 0;
-    let backup_root = import_backup_root(dsh);
+    let mut skipped = 0;
+    let backup_root = import_backup_root(&canonical_dsh);
     let mut backed_up = 0;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
@@ -1626,15 +1649,25 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
             continue;
         }
 
-        let Some(relative_path) = normalize_zip_entry_name(&name) else {
-            eprintln!("skipping unsafe ZIP entry: {name:?}");
+        let entry_name = if entry.is_dir() { name.trim_end_matches(['/', '\\']) } else { &name };
+        let Some(relative_path) = normalize_zip_entry_name(entry_name) else {
+            skipped += 1;
             continue;
         };
-        let out_path = dsh.join(&relative_path);
+        let out_path = canonical_dsh.join(&relative_path);
 
-        let canonical_dsh = dsh.canonicalize().unwrap_or_else(|_| dsh.to_path_buf());
-        if !out_path.starts_with(&canonical_dsh) {
-            continue;
+        // 根目录可以是别名,但归档中的目标不能通过现有子路径链接写到根目录之外。
+        let mut current = canonical_dsh.clone();
+        for component in relative_path.components() {
+            current.push(component);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(format!("导入中止: 目标路径包含符号链接 {}。已写入 {extracted} 个文件，备份目录: {}", current.display(), backup_root.display()));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(format!("检查目标路径 {} 失败: {e}", current.display())),
+            }
         }
 
         if entry.is_dir() {
@@ -1669,6 +1702,10 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
         }
     }
 
+    if extracted == 0 {
+        return Err(format!("没有导入任何配置文件（跳过 {skipped} 个无效条目）。请确认选择的是通过本应用导出的配置 ZIP。"));
+    }
+
     let backup_note = if backed_up > 0 {
         format!(
             "\n原配置已备份 ({} 个文件): {}",
@@ -1679,8 +1716,8 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
         String::new()
     };
     Ok(format!(
-        "已导入 {} 个配置文件。{}\n重启 DSH 后生效。",
-        extracted, backup_note
+        "已导入 {} 个配置文件。{}\n配置目录: {}\n跳过无效条目: {}\n\n请从菜单「配置 → 退出 DeepSeek Harness」彻底退出，再重新启动。\n仅关闭窗口或重新打开插件页面不会重启后端。\n若复用了终端启动的 DSH，也需重启该终端实例。\n\n这里只恢复配置，不包含插件安装包。若新电脑缺少插件，请先执行 dsh plugin --profile <配置名> install（网页配置名通常为 web）。",
+        extracted, backup_note, canonical_dsh.display(), skipped
     ))
 }
 
@@ -2212,6 +2249,128 @@ mod tests {
             .expect("worker stalled"));
         tauri::async_runtime::block_on(worker).unwrap();
         drop(listener);
+    }
+
+    struct ConfigFixture(PathBuf);
+
+    impl ConfigFixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "dsh-config-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn archive(&self, entries: &[(&str, &str)]) -> PathBuf {
+            let path = self.0.join("config.zip");
+            let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
+            for (name, contents) in entries {
+                zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+                zip.write_all(contents.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+            path
+        }
+    }
+
+    impl Drop for ConfigFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn config_roundtrip_restores_profiles_and_backs_up_existing_files() {
+        let fixture = ConfigFixture::new();
+        let source = fixture.0.join("source");
+        let target = fixture.0.join("target");
+        fs::create_dir_all(source.join("profiles/web")).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(source.join("settings.yaml"), "theme: dark").unwrap();
+        fs::write(source.join("cordis.patch.yml"), "global: true").unwrap();
+        fs::write(source.join("profiles/web/pnpm-lock.yaml"), "lockfileVersion: '9.0'").unwrap();
+        fs::write(source.join("profiles/web/cordis.patch.yml"), "plugins: {}").unwrap();
+        fs::write(source.join("profiles/web/package.json"), "{\"dependencies\":{}}").unwrap();
+        fs::write(source.join(".credentials.yaml"), "test-only-key").unwrap();
+        fs::write(target.join("settings.yaml"), "theme: light").unwrap();
+        let archive = fixture.0.join("export.zip");
+        build_export_zip(&source, &archive, false).unwrap();
+        let result = extract_import_zip(&target, &archive).unwrap();
+        assert!(result.contains("5 个配置文件"), "{result}");
+        assert_eq!(fs::read_to_string(target.join("cordis.patch.yml")).unwrap(), "global: true");
+        assert_eq!(fs::read_to_string(target.join("profiles/web/pnpm-lock.yaml")).unwrap(), "lockfileVersion: '9.0'");
+        assert_eq!(fs::read_to_string(target.join("settings.yaml")).unwrap(), "theme: dark");
+        assert_eq!(fs::read_to_string(target.join("profiles/web/cordis.patch.yml")).unwrap(), "plugins: {}");
+        assert!(target.join("profiles/web/package.json").is_file());
+        assert!(!target.join(".credentials.yaml").exists());
+        let backup = fs::read_dir(&fixture.0).unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(".dsh-import-backup-"))
+            .expect("backup directory");
+        assert_eq!(fs::read_to_string(backup.join("settings.yaml")).unwrap(), "theme: light");
+    }
+
+    #[test]
+    fn config_import_does_not_report_empty_archive_as_success() {
+        let fixture = ConfigFixture::new();
+        let archive = fixture.archive(&[("_export-manifest.json", "{}")]);
+        assert!(extract_import_zip(&fixture.0.join("target"), &archive).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_import_accepts_a_symlinked_home() {
+        let fixture = ConfigFixture::new();
+        let real = fixture.0.join("real");
+        let alias = fixture.0.join("alias");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let archive = fixture.archive(&[("settings.yaml", "theme: dark")]);
+        let result = extract_import_zip(&alias, &archive).unwrap();
+        assert!(result.contains("1 个配置文件"), "{result}");
+        assert_eq!(fs::read_to_string(real.join("settings.yaml")).unwrap(), "theme: dark");
+    }
+
+    #[test]
+    fn config_import_accepts_legacy_windows_entry_names() {
+        let fixture = ConfigFixture::new();
+        let archive = fixture.archive(&[(r"profiles\web\cordis.patch.yml", "plugins: {}")]);
+        let target = fixture.0.join("target");
+        extract_import_zip(&target, &archive).unwrap();
+        assert_eq!(fs::read_to_string(target.join("profiles/web/cordis.patch.yml")).unwrap(), "plugins: {}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_import_does_not_follow_nested_symlinks() {
+        let fixture = ConfigFixture::new();
+        let target = fixture.0.join("target");
+        let outside = fixture.0.join("outside");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, target.join("profiles")).unwrap();
+        let archive = fixture.archive(&[("profiles/settings.yaml", "new")]);
+        assert!(extract_import_zip(&target, &archive).is_err());
+        assert!(!outside.join("settings.yaml").exists());
+    }
+
+    #[test]
+    fn config_callbacks_use_native_results_and_background_io() {
+        let source = include_str!("main.rs");
+        for (start, end) in [("fn do_export(", "fn build_export_zip("), ("fn do_import(", "fn extract_import_zip(")] {
+            let body = &source[source.find(start).unwrap()..source.find(end).unwrap()];
+            assert!(!body.contains("alert("));
+            assert!(body.contains("show_config_result("));
+            assert!(body.contains("spawn_blocking("));
+            assert!(body.contains("show_status("));
+        }
+        let result = &source[source.find("fn show_config_result(").unwrap()..source.find("fn do_export(").unwrap()];
+        assert!(result.contains("app.dialog().message("));
+        assert!(result.contains("dialog.show("));
     }
 
     #[test]
