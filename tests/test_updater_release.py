@@ -159,6 +159,38 @@ class UpdaterWorkflowTests(unittest.TestCase):
         self.assertIn("minisign", text.lower())
         self.assertIn("latest.json", text)
 
+    def _run_scripts(self):
+        for job_id, job in self.workflow["jobs"].items():
+            for step in job.get("steps") or []:
+                if "run" in step:
+                    yield job_id, step
+
+    def test_run_scripts_carry_no_placeholder_interpolation(self):
+        # GitHub 会把 run 脚本里的插值一律当表达式求值,连注释里的占位符也不放过。
+        # 里面一旦出现 `...` 这种非法 token,整个 workflow 在解析阶段就被判为无效:
+        # 表现为 "This run likely failed because of a workflow file issue",0 个 job。
+        # 2026-09-18 实际踩到过(注释里写了插值占位符,v1.4.13 的发布跑了个空)。
+        checked = 0
+        for job_id, step in self._run_scripts():
+            for match in re.finditer(r"\$\{\{(.*?)\}\}", step["run"], re.S):
+                checked += 1
+                self.assertNotIn(
+                    "...",
+                    match.group(1),
+                    f"{job_id}: {match.group(0)!r} 是占位符,会被当成表达式解析",
+                )
+        self.assertGreater(checked, 0, "run 脚本里应当有表达式(至少 guard 那一步)")
+
+    def test_run_script_comments_carry_no_interpolation(self):
+        for job_id, step in self._run_scripts():
+            for line in step["run"].splitlines():
+                if line.lstrip().startswith("#"):
+                    self.assertNotIn(
+                        "${{",
+                        line,
+                        f"{job_id}: 注释里的插值照样会被求值 -> {line.strip()}",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
