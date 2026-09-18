@@ -191,6 +191,26 @@ class UpdaterWorkflowTests(unittest.TestCase):
                         f"{job_id}: 注释里的插值照样会被求值 -> {line.strip()}",
                     )
 
+    def test_gh_commands_always_have_a_git_repository_context(self):
+        # gh 推断仓库时会先跑 `git remote -v`,没有 git 仓库就直接
+        # "failed to run git: fatal: not a git repository"。2026-09-18 踩到过:
+        # create-release 只用 gh 命令、没有 checkout,流水线第 3 秒就挂了。
+        for job_id, job in self.workflow["jobs"].items():
+            steps = job.get("steps") or []
+            scripts = [s["run"] for s in steps if "run" in s]
+            if not any(re.search(r"\bgh\s+(release|api|run|workflow|pr)\b", s) for s in scripts):
+                continue
+            has_checkout = any(
+                str(s.get("uses", "")).startswith("actions/checkout") for s in steps
+            )
+            has_gh_repo = "GH_REPO" in (job.get("env") or {}) or any(
+                "GH_REPO" in (s.get("env") or {}) for s in steps
+            )
+            self.assertTrue(
+                has_checkout or has_gh_repo,
+                f"{job_id}: 调用了 gh 却没有 actions/checkout 也没有 GH_REPO,gh 找不到仓库",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
