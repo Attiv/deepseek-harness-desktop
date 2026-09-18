@@ -18,8 +18,9 @@ use std::os::unix::process::CommandExt;
 use std::os::windows::process::CommandExt;
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tauri_plugin_updater::UpdaterExt;
 
 const DSH_PORT: u16 = 3080;
 const DSH_URL: &str = "http://127.0.0.1:3080";
@@ -38,6 +39,27 @@ const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(400);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(400);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 static PLUGIN_UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+// 更新清单地址不在代码里 —— tauri.conf.json 的 `plugins.updater.endpoints` 是唯一出处,
+// 更新器直接读它。下面两个兜底地址必须指向同一个仓库,由
+// `updater_config_in_tauri_conf_matches_the_code` 单测拦住漏改(换仓库最容易只改一处)。
+
+/// 兜底通道用的最新 Release 接口(公开仓库,无需鉴权)。
+const RELEASE_API: &str =
+    "https://api.github.com/repos/Attiv/deepseek-harness-desktop/releases/latest";
+/// 兜底通道给用户打开的下载页。
+const RELEASES_PAGE: &str = "https://github.com/Attiv/deepseek-harness-desktop/releases/latest";
+/// 「启动时自动检查更新」的开关键名(顶层设置,默认开启)。
+const AUTO_CHECK_UPDATE_SETTING: &str = "app-auto-check-update";
+/// 启动后隔多久再检查更新。要避开拉起后端那几秒,别和它抢网络。
+const STARTUP_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(10);
+/// 兜底通道查询 Release 的网络预算。
+const UPDATE_CHECK_TIMEOUT_SECS: u64 = 15;
+/// 下载进度推到页面的最小间隔。on_chunk 每个网络分片都会触发一次,
+/// 不节流会把页面 eval 打成每秒上千次。
+const UPDATE_PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
+/// 同一时刻只允许一个更新任务,避免连点菜单叠出并发下载。
+static UPDATE_TASK_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1001,6 +1023,449 @@ fn show_status(app: &tauri::AppHandle, message: &str, state: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 桌面壳自身的更新
+//
+// 两条通道:
+//   1. 官方通道:读 Release 上的 latest.json,按本机 target 取出「下载地址 + 签名」,
+//      校验 minisign 签名后原地替换并重启。清单由 CI 生成,签名私钥只存在于 CI。
+//   2. 兜底通道:官方通道不可用时(最常见的是本地自建包没注入签名公钥),
+//      直接问 GitHub Release API,按系统/架构在资产名里挑出本机该下载哪个包。
+//      只提示、只打开下载页,不动本机任何文件。
+// ---------------------------------------------------------------------------
+
+/// 本机在更新清单里的 target 标识,如 `darwin-x86_64`。取不到就不猜。
+fn local_update_target() -> Option<String> {
+    tauri_plugin_updater::target()
+}
+
+/// 把 `darwin-x86_64` 拆成 (系统, 架构) —— 资产名匹配只看这两段。
+fn split_update_target(target: &str) -> Option<(&str, &str)> {
+    target.split_once('-')
+}
+
+/// 「启动时自动检查更新」是否开启。默认开:桌面壳不会自动更新,
+/// 等于用户永远停在旧版。
+fn auto_check_update_enabled() -> bool {
+    read_setting(AUTO_CHECK_UPDATE_SETTING)
+        .map(|value| value != "off")
+        .unwrap_or(true)
+}
+
+/// 从 Release 资产名里挑出本机该下载的包。
+///
+/// 后缀顺序即优先级:优先能双击安装的(dmg / setup.exe),再 Linux 的
+/// AppImage 与 deb,最后 rpm。与网络分离的纯函数,便于拿真实资产列表回归。
+fn pick_release_asset(assets: &[String], os: &str, arch: &str) -> Option<String> {
+    let suffixes: &[&str] = match (os, arch) {
+        ("darwin", "aarch64") => &["_aarch64.dmg", "_aarch64.app.tar.gz"],
+        ("darwin", _) => &["_x64.dmg", "_x64.app.tar.gz"],
+        ("windows", _) => &["_x64-setup.exe", "_x64_en-us.msi", "_x64.msi"],
+        ("linux", "aarch64") => &["_arm64.appimage", "_arm64.deb"],
+        ("linux", _) => &["_amd64.appimage", "_amd64.deb", ".x86_64.rpm"],
+        _ => &[],
+    };
+
+    let lowered: Vec<String> = assets.iter().map(|name| name.to_lowercase()).collect();
+    for suffix in suffixes {
+        if let Some(index) = lowered.iter().position(|name| name.ends_with(suffix)) {
+            return Some(assets[index].clone());
+        }
+    }
+    None
+}
+
+/// 把 tag(`v1.4.13`)换成可以比较的版本号。
+fn parse_release_version(tag: &str) -> Option<semver::Version> {
+    semver::Version::parse(tag.trim().trim_start_matches('v')).ok()
+}
+
+/// 从 Release API 的响应里取出「最新版本 + 本机该下载的包」。
+///
+/// 抽成纯函数:真实响应的字段路径(`assets[].name`)写错一次很难在本地发现,
+/// 固定样本比联网试快得多。
+fn parse_latest_release(
+    body: &str,
+    os: &str,
+    arch: &str,
+) -> Result<(String, Option<String>), String> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("解析 Release 响应失败: {e}"))?;
+
+    let tag = json
+        .get("tag_name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Release 响应里没有 tag_name".to_string())?;
+    let version = parse_release_version(tag).ok_or_else(|| format!("无法解析版本号: {tag}"))?;
+
+    let assets: Vec<String> = json
+        .get("assets")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("name").and_then(|name| name.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok((version.to_string(), pick_release_asset(&assets, os, arch)))
+}
+
+/// 直接问 GitHub API 要最新 Release。仅在官方通道不可用时调用。
+fn fetch_latest_release() -> Result<(String, Option<String>), String> {
+    let target = local_update_target().ok_or_else(|| "无法识别本机平台".to_string())?;
+    let (os, arch) =
+        split_update_target(&target).ok_or_else(|| format!("平台标识异常: {target}"))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(UPDATE_CHECK_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
+    // 用 text() 而不是 json():reqwest 的 json 特性没开,serde_json 本来就在依赖里
+    let raw_body = client
+        .get(RELEASE_API)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .map_err(|e| format!("请求 GitHub Release 失败: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("GitHub Release 接口返回错误: {e}"))?
+        .text()
+        .map_err(|e| format!("读取 Release 响应失败: {e}"))?;
+
+    parse_latest_release(&raw_body, os, arch)
+}
+
+/// 用系统默认浏览器打开链接。只为打开下载页,不值得为此引入 opener 插件。
+fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        // start 的第一个参数是窗口标题,留空才不会被当成 URL 的一部分
+        command.arg("/C").arg("start").arg("").arg(url);
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("启动浏览器失败: {error}"))
+}
+
+/// conf 里 `plugins.updater.pubkey` 是否被注入了真实公钥。
+///
+/// 留空 = 本地自建包。这种包里 `check()` 照样能成功(读清单不验签),
+/// 但下载完一定卡在验签 —— 与其让用户下完几十 MB 才看到红字,不如提前判定。
+/// 抽成纯函数,便于用真实 conf 片段回归。
+fn has_configured_updater_pubkey(
+    plugins: &std::collections::HashMap<String, serde_json::Value>,
+) -> bool {
+    plugins
+        .get("updater")
+        .and_then(|updater| updater.get("pubkey"))
+        .and_then(|pubkey| pubkey.as_str())
+        .map(|pubkey| !pubkey.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// 读运行中的配置判断官方通道能不能用。
+fn updater_pubkey_configured(app: &tauri::AppHandle) -> bool {
+    has_configured_updater_pubkey(&app.config().plugins.0)
+}
+
+/// 检查更新。`manual` 表示来自菜单点击 —— 那条路径无论结果如何都要给回执。
+fn check_for_updates(app: &tauri::AppHandle, manual: bool) {
+    if UPDATE_TASK_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        if manual {
+            show_status(app, "更新检查已经在进行中，请等待当前任务结束。", "error");
+        }
+        return;
+    }
+
+    if manual {
+        show_status(app, "正在检查更新…", "running");
+    }
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome = run_update_check(&app, manual).await;
+        UPDATE_TASK_RUNNING.store(false, Ordering::Release);
+
+        if let Err(reason) = outcome {
+            // 自动检查失败就闭嘴:离线、公司代理、GitHub 抖动都不该在用户面前刷红条。
+            if manual {
+                show_status(&app, &format!("检查更新失败：{reason}"), "error");
+            }
+        }
+    });
+}
+
+/// 一次更新检查。成功路径自己负责弹窗,失败把原因交给调用方决定要不要打扰用户。
+async fn run_update_check(app: &tauri::AppHandle, manual: bool) -> Result<(), String> {
+    // 本地自建包没有签名公钥:直接走兜底通道,别让用户下完才发现验签不过。
+    if !updater_pubkey_configured(app) {
+        if manual {
+            show_status(app, "本机构建未配置更新签名公钥，改用 Release 接口核对…", "running");
+        }
+        return offer_manual_download(app, manual).await;
+    }
+
+    let updater = app.updater().map_err(|error| error.to_string())?;
+
+    match updater.check().await {
+        Ok(Some(update)) => {
+            prompt_install_update(app, update);
+            Ok(())
+        }
+        Ok(None) => {
+            if manual {
+                show_status(
+                    app,
+                    &format!("已是最新版本 v{}。", env!("CARGO_PKG_VERSION")),
+                    "info",
+                );
+            }
+            Ok(())
+        }
+        Err(updater_error) => {
+            // 官方通道用不了(清单取不到、网络被挡等)。
+            // 退化成「只报版本 + 告诉你该下哪个包」,手动下载这条路始终可用。
+            if manual {
+                show_status(app, "官方更新通道不可用，改用 Release 接口核对…", "running");
+            }
+            offer_manual_download(app, manual)
+                .await
+                .map_err(|fallback| format!("官方通道 {updater_error}；Release 接口 {fallback}"))
+        }
+    }
+}
+
+/// 提示发现新版本。对话框里直接写明「本机对应哪个包」,
+/// 免得用户面对一堆 dmg / exe / deb / rpm 自己猜。
+fn prompt_install_update(app: &tauri::AppHandle, update: tauri_plugin_updater::Update) {
+    let current = update.current_version.clone();
+    let version = update.version.clone();
+    let target = update.target.clone();
+    let package = update
+        .download_url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .unwrap_or("更新包")
+        .to_string();
+
+    show_status(
+        app,
+        &format!("发现新版本 v{version}（当前 v{current}），本机对应 {package}"),
+        "running",
+    );
+
+    let mut message =
+        format!("当前版本：v{current}\n最新版本：v{version}\n本机目标：{target}\n对应安装包：{package}");
+    let notes = update.body.as_deref().unwrap_or("").trim();
+    if !notes.is_empty() {
+        message.push_str("\n\n更新说明：\n");
+        message.push_str(notes);
+    }
+
+    let app = app.clone();
+    let mut dialog = app
+        .dialog()
+        .message(message)
+        .title("发现新版本")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "立即更新".to_string(),
+            "稍后".to_string(),
+        ));
+    if let Some(window) = app.get_webview_window("main") {
+        dialog = dialog.parent(&window);
+    }
+    dialog.show(move |accepted| {
+        if accepted {
+            install_update(&app, update);
+        }
+    });
+}
+
+/// 下载并安装更新。进度走页面右上角的状态条。
+fn install_update(app: &tauri::AppHandle, update: tauri_plugin_updater::Update) {
+    show_status(app, "开始下载更新…", "running");
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // on_chunk 每个网络分片都会触发一次,必须节流后再 eval 到页面。
+        let mut downloaded: u64 = 0;
+        let mut last_report = Instant::now();
+        let progress_app = app.clone();
+
+        let result = update
+            .download_and_install(
+                move |chunk_len, total| {
+                    downloaded = downloaded.saturating_add(chunk_len as u64);
+                    if last_report.elapsed() < UPDATE_PROGRESS_INTERVAL {
+                        return;
+                    }
+                    last_report = Instant::now();
+
+                    let megabytes = downloaded as f64 / 1_048_576.0;
+                    let text = match total {
+                        Some(total) if total > 0 => format!(
+                            "正在下载更新 {:.1} MB / {:.1} MB（{}%）",
+                            megabytes,
+                            total as f64 / 1_048_576.0,
+                            downloaded.saturating_mul(100) / total
+                        ),
+                        _ => format!("正在下载更新 {:.1} MB", megabytes),
+                    };
+                    show_status(&progress_app, &text, "running");
+                },
+                || {},
+            )
+            .await;
+
+        match result {
+            Ok(()) => {
+                show_status(&app, "更新已安装，正在重启…", "success");
+
+                // Windows 的 NSIS/MSI 安装器会把应用自己重新拉起来(默认 /R),
+                // macOS / Linux 落到新版本上还得我们自己重启一次。
+                #[cfg(not(target_os = "windows"))]
+                {
+                    // 先收掉自己拉起的后端:否则重启后 3080 还被上一代的 node 占着,
+                    // 新实例只能复用这个「不属于自己」的进程,退出时也清不掉。
+                    stop_owned_dsh(&app);
+                    app.restart();
+                }
+            }
+            Err(error) => {
+                show_status(
+                    &app,
+                    &format!("更新安装失败：{error}\n可从 {RELEASES_PAGE} 手动下载安装。"),
+                    "error",
+                );
+            }
+        }
+    });
+}
+
+/// 兜底:官方通道不可用时只核对版本,并告诉用户本机该下哪个包。
+/// 不改本机任何文件,唯一的副作用是用户可以点开浏览器。
+async fn offer_manual_download(app: &tauri::AppHandle, manual: bool) -> Result<(), String> {
+    let (latest, asset) = tauri::async_runtime::spawn_blocking(fetch_latest_release)
+        .await
+        .map_err(|error| format!("Release 查询任务失败: {error}"))??;
+
+    let current = env!("CARGO_PKG_VERSION");
+    let is_newer = match (parse_release_version(&latest), parse_release_version(current)) {
+        (Some(latest), Some(current)) => latest > current,
+        _ => false,
+    };
+
+    if !is_newer {
+        if manual {
+            show_status(app, &format!("已是最新版本 v{current}。"), "info");
+        }
+        return Ok(());
+    }
+
+    let target = local_update_target().unwrap_or_else(|| "未知平台".to_string());
+    let package = asset.unwrap_or_else(|| "未匹配到本机可用的安装包".to_string());
+
+    show_status(
+        app,
+        &format!("有新版本 v{latest}（当前 v{current}），本机应下载 {package}"),
+        "info",
+    );
+
+    let message = format!(
+        "官方更新通道不可用（本机构建未注入签名公钥）。\n\n\
+         最新版本：v{latest}\n\
+         当前版本：v{current}\n\
+         本机目标：{target}\n\
+         对应安装包：{package}\n\n\
+         点「打开下载页」后在 Release 列表里按上面的文件名选择下载。"
+    );
+
+    let app = app.clone();
+    let mut dialog = app
+        .dialog()
+        .message(message)
+        .title("发现新版本")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "打开下载页".to_string(),
+            "知道了".to_string(),
+        ));
+    if let Some(window) = app.get_webview_window("main") {
+        dialog = dialog.parent(&window);
+    }
+    dialog.show(move |open_page| {
+        if open_page {
+            if let Err(error) = open_url(RELEASES_PAGE) {
+                show_status(&app, &format!("打开浏览器失败：{error}"), "error");
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// 切换「启动时自动检查更新」。写进 ~/.dsh/settings.yaml 顶层,重启后仍生效。
+fn toggle_auto_check_update(app: &tauri::AppHandle) {
+    let next = if auto_check_update_enabled() { "off" } else { "on" };
+
+    match write_setting_value(AUTO_CHECK_UPDATE_SETTING, next) {
+        Ok(()) => {
+            // 勾选状态在菜单项里,改完得重建菜单
+            if let Err(error) = rebuild_menu(app) {
+                eprintln!("切换自动检查更新后重建菜单失败: {error}");
+            }
+            show_status(
+                app,
+                match next {
+                    "off" => "已关闭启动时自动检查更新；仍可用菜单「检查更新…」手动检查。",
+                    _ => "已开启启动时自动检查更新。",
+                },
+                "success",
+            );
+        }
+        Err(error) => show_status(app, &format!("写入设置失败：{error}"), "error"),
+    }
+}
+
+/// 启动后延迟做一次静默更新检查。
+/// 用独立线程 sleep 再交给异步运行时,不跟启动流程抢调度预算。
+fn schedule_startup_update_check(app: &tauri::AppHandle) {
+    if !auto_check_update_enabled() {
+        return;
+    }
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(STARTUP_UPDATE_CHECK_DELAY);
+        check_for_updates(&app, false);
+    });
+}
+
 /// Update every dependency declared by the web profile, without touching the
 /// DSH settings or credentials files. Output is retained for support reports.
 fn update_web_profile_plugins(app: &tauri::AppHandle) {
@@ -1409,6 +1874,13 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .build(app).map_err(|e| e.to_string())?;
     let update_plugins_item = MenuItemBuilder::with_id("update-plugins", "一键更新全部插件")
         .build(app).map_err(|e| e.to_string())?;
+    let check_update_item = MenuItemBuilder::with_id("check-update", "检查更新…")
+        .build(app).map_err(|e| e.to_string())?;
+    // 勾选状态从设置里读,不用额外维护内存态
+    let auto_check_update_item =
+        CheckMenuItemBuilder::with_id("auto-check-update", "启动时自动检查更新")
+            .checked(auto_check_update_enabled())
+            .build(app).map_err(|e| e.to_string())?;
     let version_item = MenuItemBuilder::with_id(
         "version",
         format!("版本信息 v{}", env!("CARGO_PKG_VERSION")),
@@ -1445,6 +1917,9 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .separator()
         .item(&import_item)
         .item(&update_plugins_item)
+        .separator()
+        .item(&check_update_item)
+        .item(&auto_check_update_item)
         .separator()
         .item(&version_item)
         .item(&quit_item)
@@ -1822,6 +2297,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(_single)
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![set_shortcut_cmd, close_shortcut_window])
         .manage(CurrentShortcut(Mutex::new(shortcut)))
         .manage(DshChild(Mutex::new(None)))
@@ -2090,6 +2566,10 @@ fn main() {
                 }
             });
 
+            // 启动后再静默检查桌面壳自己的更新:排在拉起后端之后,
+            // 不跟启动流程抢网络,也不至于在用户刚打开窗口时就弹东西。
+            schedule_startup_update_check(&app.handle());
+
             Ok(())
         })
         .on_menu_event(move |app, event| {
@@ -2137,6 +2617,8 @@ fn main() {
                 "export-cred" => do_export(app, true),
                 "import" => do_import(app),
                 "update-plugins" => update_web_profile_plugins(app),
+                "check-update" => check_for_updates(app, true),
+                "auto-check-update" => toggle_auto_check_update(app),
                 "version" => {
                     show_status(
                         app,
@@ -2255,12 +2737,21 @@ mod tests {
 
     impl ConfigFixture {
         fn new() -> Self {
+            // 序号必须进目录名:macOS 上 SystemTime::now() 只有微秒粒度
+            // (as_nanos() 末三位恒为 000),并行测试在同一微秒内取时间就会撞出同名目录。
+            // 后果不只是共享目录 —— 一个测试的 File::create 会截断另一个正在读的
+            // config.zip,表现为随机的 "Invalid checksum" / "Could not find EOCD"。
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "dsh-config-test-{}-{}",
+                "dsh-config-test-{}-{}-{}",
                 std::process::id(),
+                seq,
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
             ));
+            // 撞名会静默共享目录(create_dir_all 对已存在的目录返回 Ok),所以自己查一遍。
+            assert!(!path.exists(), "fixture 路径撞名: {}", path.display());
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }
@@ -3020,5 +3511,173 @@ app-dsh-channel: \"latest\"
         println!("registry = {}", npm_registry());
         println!("newest channel = {} -> spec {}@{}", channel, DSH_PACKAGE, channel);
         assert!(is_safe_spec_token(&channel));
+    }
+
+    /// 用 v1.4.12 实际发布出来的资产名做回归:平台/架构 → 本机该下哪个包。
+    /// 资产命名由 tauri-action 决定,一旦漂移这里先炸。
+    #[test]
+    fn picks_the_installer_matching_the_host_platform() {
+        let assets: Vec<String> = [
+            "DeepSeek.Harness-1.4.12-1.x86_64.rpm",
+            "DeepSeek.Harness_1.4.12_aarch64.dmg",
+            "DeepSeek.Harness_1.4.12_amd64.AppImage",
+            "DeepSeek.Harness_1.4.12_amd64.deb",
+            "DeepSeek.Harness_1.4.12_x64-setup.exe",
+            "DeepSeek.Harness_1.4.12_x64.dmg",
+            "DeepSeek.Harness_1.4.12_x64_en-US.msi",
+            "DeepSeek.Harness_aarch64.app.tar.gz",
+            "DeepSeek.Harness_x64.app.tar.gz",
+            "latest.json",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+
+        assert_eq!(
+            pick_release_asset(&assets, "darwin", "x86_64").as_deref(),
+            Some("DeepSeek.Harness_1.4.12_x64.dmg"),
+            "Intel Mac 不能被 aarch64 的包骗走"
+        );
+        assert_eq!(
+            pick_release_asset(&assets, "darwin", "aarch64").as_deref(),
+            Some("DeepSeek.Harness_1.4.12_aarch64.dmg")
+        );
+        assert_eq!(
+            pick_release_asset(&assets, "windows", "x86_64").as_deref(),
+            Some("DeepSeek.Harness_1.4.12_x64-setup.exe")
+        );
+        assert_eq!(
+            pick_release_asset(&assets, "linux", "x86_64").as_deref(),
+            Some("DeepSeek.Harness_1.4.12_amd64.AppImage")
+        );
+        // 认不出的平台宁可不给建议,也不要瞎推一个用户装不上的包
+        assert_eq!(pick_release_asset(&assets, "freebsd", "x86_64"), None);
+    }
+
+    /// 少了主平台安装包时退到下一个候选(dmg 没有就给 app.tar.gz)。
+    #[test]
+    fn falls_back_to_the_next_asset_candidate() {
+        let assets = vec!["DeepSeek.Harness_x64.app.tar.gz".to_string()];
+        assert_eq!(
+            pick_release_asset(&assets, "darwin", "x86_64").as_deref(),
+            Some("DeepSeek.Harness_x64.app.tar.gz")
+        );
+
+        let linux = vec!["DeepSeek.Harness-1.4.12-1.x86_64.rpm".to_string()];
+        assert_eq!(
+            pick_release_asset(&linux, "linux", "x86_64").as_deref(),
+            Some("DeepSeek.Harness-1.4.12-1.x86_64.rpm")
+        );
+    }
+
+    /// tag 上带不带 v 都要能比:两种写法 GitHub 上都常见。
+    #[test]
+    fn parses_release_versions_with_or_without_the_v_prefix() {
+        assert_eq!(
+            parse_release_version("v1.4.13").map(|v| v.to_string()).as_deref(),
+            Some("1.4.13")
+        );
+        assert_eq!(
+            parse_release_version("1.4.13").map(|v| v.to_string()).as_deref(),
+            Some("1.4.13")
+        );
+        assert!(parse_release_version("nightly").is_none());
+        assert!(parse_release_version("release-1.4").is_none());
+    }
+
+    #[test]
+    fn splits_the_updater_target_into_os_and_arch() {
+        assert_eq!(split_update_target("darwin-x86_64"), Some(("darwin", "x86_64")));
+        assert_eq!(split_update_target("linux-aarch64"), Some(("linux", "aarch64")));
+        // 没有横线就是异常标识,别硬拆
+        assert_eq!(split_update_target("darwin"), None);
+    }
+
+    /// Release 响应里只用得到 tag_name 与 assets[].name,
+    /// 但字段路径写错在本地很难发现 —— 固定样本挡住这类回归。
+    #[test]
+    fn parses_release_payload_and_matches_the_local_package() {
+        let body = r#"{
+            "tag_name": "v1.4.13",
+            "name": "DeepSeek Harness Desktop v1.4.13",
+            "assets": [
+                {"name": "latest.json", "browser_download_url": "https://example.invalid/latest.json"},
+                {"name": "DeepSeek.Harness_1.4.13_aarch64.dmg", "browser_download_url": "https://example.invalid/arm.dmg"},
+                {"name": "DeepSeek.Harness_1.4.13_x64.dmg", "browser_download_url": "https://example.invalid/x64.dmg"}
+            ]
+        }"#;
+
+        let (version, asset) = parse_latest_release(body, "darwin", "x86_64").expect("应能解析");
+        assert_eq!(version, "1.4.13");
+        assert_eq!(asset.as_deref(), Some("DeepSeek.Harness_1.4.13_x64.dmg"));
+    }
+
+    /// 没有 assets 时不能报错,只把「该下哪个包」留空 —— 版本信息本身仍然有用。
+    #[test]
+    fn tolerates_a_release_without_assets() {
+        let (version, asset) =
+            parse_latest_release(r#"{"tag_name": "v1.4.13"}"#, "darwin", "x86_64").expect("应能解析");
+        assert_eq!(version, "1.4.13");
+        assert_eq!(asset, None);
+    }
+
+    /// 拿不到可比较的版本号就报错,而不是当成空版本继续往下比。
+    #[test]
+    fn rejects_release_payloads_without_a_version() {
+        assert!(parse_latest_release("not json at all", "darwin", "x86_64").is_err());
+        assert!(parse_latest_release(r#"{"assets": []}"#, "darwin", "x86_64").is_err());
+        assert!(parse_latest_release(r#"{"tag_name": "nightly"}"#, "darwin", "x86_64").is_err());
+    }
+
+    /// 「本地自建包」的判定:pubkey 为空、只有空白、或整段缺失都算没配。
+    /// 判错的代价很实在 —— 判成「已配」就是让用户下完才看到验签失败。
+    #[test]
+    fn detects_whether_the_updater_pubkey_is_configured() {
+        fn plugins(raw: &str) -> std::collections::HashMap<String, serde_json::Value> {
+            serde_json::from_str(raw).expect("样本应是合法 JSON")
+        }
+
+        assert!(!has_configured_updater_pubkey(&plugins(r#"{}"#)));
+        assert!(!has_configured_updater_pubkey(&plugins(r#"{"updater": {}}"#)));
+        assert!(!has_configured_updater_pubkey(&plugins(r#"{"updater": {"pubkey": ""}}"#)));
+        assert!(!has_configured_updater_pubkey(&plugins(r#"{"updater": {"pubkey": "  \n "}}"#)));
+        assert!(has_configured_updater_pubkey(&plugins(
+            r#"{"updater": {"pubkey": "untrusted comment: minisign public key ABC\nRWRkZW1v"}}"#
+        )));
+    }
+
+    /// 清单地址、两个兜底地址、以及「本地能不能构建」这几件事必须互相对得上:
+    /// 换仓库或误开签名开关时,这条测试先炸。
+    #[test]
+    fn updater_config_in_tauri_conf_matches_the_code() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("配置应是合法 JSON");
+
+        let endpoints = conf["plugins"]["updater"]["endpoints"]
+            .as_array()
+            .expect("plugins.updater.endpoints 必须存在,否则更新器启动即报 EmptyEndpoints");
+        assert_eq!(endpoints.len(), 1, "多端点会掩盖清单 404,这里只保留一个");
+
+        let endpoint = endpoints[0].as_str().expect("endpoint 应是字符串");
+        // 仓库路径只写在这一处,另两个地址从它派生比较 —— 换仓库漏改一处就被拦住
+        let repo = endpoint
+            .strip_prefix("https://github.com/")
+            .and_then(|rest| rest.split("/releases/").next())
+            .expect("endpoint 应形如 https://github.com/<owner>/<repo>/releases/...");
+        assert!(repo.contains('/'), "仓库路径应形如 owner/repo，实际: {repo}");
+        assert!(
+            RELEASE_API.contains(repo),
+            "兜底 API 与清单地址不是同一个仓库: {RELEASE_API}"
+        );
+        assert!(
+            RELEASES_PAGE.contains(repo),
+            "下载页与清单地址不是同一个仓库: {RELEASES_PAGE}"
+        );
+
+        // 仓库里保留「不签名」的默认值:createUpdaterArtifacts 为 true 而环境里没有
+        // TAURI_SIGNING_PRIVATE_KEY 时,连本地 npx tauri build 都会直接失败。
+        // 发布流程会同时注入公钥并把这一项改成 true。
+        assert_eq!(conf["bundle"]["createUpdaterArtifacts"].as_bool(), Some(false));
+        assert_eq!(conf["plugins"]["updater"]["pubkey"].as_str(), Some(""));
     }
 }

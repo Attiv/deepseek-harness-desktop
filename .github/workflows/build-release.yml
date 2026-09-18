@@ -1,7 +1,19 @@
 name: Build & Release
 
+# 发布流程分三段,原因是自动更新要求产物「签名 + 清单齐全」:
+#   1. create-release  先在 draft 里占位(草稿不会被 releases/latest 看见)
+#   2. build           四个平台串行构建并上传,tauri-action 会把每个平台的
+#                      签名产物合并进同一个 latest.json
+#   3. publish-release 校验 latest.json 四个平台齐全且带 signature,才把 draft 转正
+# 任何一步缺失都留在 draft,线上用户看不到半成品。
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        # 必须是仓库里**已存在**的版本 tag(形如 v1.4.13),用来重跑某次发布
+        description: "已存在的版本 tag（形如 v1.4.13）"
+        required: true
+        type: string
   push:
     tags:
       - "v*"
@@ -9,43 +21,101 @@ on:
 permissions:
   contents: write
 
+# 同一时间只允许一条发布流水线,否则两个 tag 会互相覆盖 latest.json
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
-  # Job 1: 创建 Release(只跑一次)
+  # Job 1: 创建 draft release(只跑一次)
   create-release:
     runs-on: ubuntu-latest
+    # 只有「tag 推送」或「手动指定 tag」才发布;其他触发一律跳过
+    if: github.ref_type == 'tag' || inputs.tag != ''
     outputs:
-      release-url: ${{ steps.create.outputs.url }}
+      release_id: ${{ steps.create.outputs.release_id }}
+      tag: ${{ steps.create.outputs.tag }}
+      tag_version: ${{ steps.create.outputs.tag_version }}
     steps:
-      - name: Create Release
+      - name: Create draft release
         id: create
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: "DeepSeek Harness Desktop ${{ github.ref_name }}"
-          body: |
-            ## DeepSeek Harness Desktop
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
 
-            自动构建的桌面应用,支持 Windows / macOS / Linux。
+          # tag 从 env 进来:不把表达式直接插进脚本,避免 tag 里的字符变成 shell 语法
+          TAG="${INPUT_TAG:-$EVENT_REF}"
+          if [[ ! "$TAG" =~ ^v[0-9] ]]; then
+            echo "::error::tag 必须形如 v1.2.3，收到: '$TAG'"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG version=$VERSION"
 
-            ### 安装
-            - **Windows**: 下载 `*-setup.exe`(NSIS 安装程序)或 `*.msi`
-            - **macOS**: 下载 `.dmg`(Intel 用 x64,Apple Silicon 用 aarch64)
-            - **Linux**: 下载 `.AppImage` 或 `.deb`
+          # 已发布的 tag 不允许重跑:更新器已经把它当成 latest 分发出去了,
+          # 覆盖同一份清单会让已经装过的人版本号与内容错位。
+          state="$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)"
+          case "$state" in
+            false)
+              echo "::error::Release $TAG 已发布，拒绝重复发布。如需重发请先在 Releases 页面删除该 Release。"
+              exit 1
+              ;;
+            true)
+              echo "复用已存在的 draft release: $TAG"
+              ;;
+            *)
+              cat > "$RUNNER_TEMP/body.md" <<'MARKDOWN'
+          ## DeepSeek Harness Desktop
 
-            ### 说明
-            - 修复桌面启动轮询卡死、进度停更及启动超时失效
-            - 默认使用 npm `next` 预览频道；可通过菜单「配置 → DSH 频道」切回 `latest` 稳定版
-            - 后端优先走 `pnpm dlx @deepseek-ai/dsh@<频道> web --no-open`,没装 pnpm 时自动回退 `npx -y`
-            - 菜单「配置 → 一键更新全部插件」会更新 web profile 的全部插件,完成后重启 DSH 生效
-            - 需要 **Node.js ≥ 22.19**(新版 dsh 依赖);pnpm 可选
-          draft: false
-          prerelease: false
+          自动构建的桌面应用,支持 Windows / macOS / Linux。
 
-  # Job 2: 并行构建各平台,上传产物到 Release
+          ### 安装
+          - **Windows**: 下载 `*-setup.exe`(NSIS 安装程序)或 `*.msi`
+          - **macOS**: 下载 `.dmg`(Intel 用 x64,Apple Silicon 用 aarch64)
+          - **Linux**: 下载 `.AppImage` / `.deb` / `.rpm`
+
+          ### 内置更新
+          应用内置 `配置 → 检查更新…`,直接读取本 Release 的 `latest.json`,
+          按本机系统与架构自动选择对应包并校验签名后安装。手动下载永远可用。
+
+          需要 **Node.js ≥ 22.19**(新版 dsh 依赖);pnpm 可选。
+          MARKDOWN
+              gh release create "$TAG" \
+                --draft \
+                --title "DeepSeek Harness Desktop $TAG" \
+                --notes-file "$RUNNER_TEMP/body.md"
+              ;;
+          esac
+
+          RELEASE_ID="$(gh release view "$TAG" --json databaseId --jq '.databaseId')"
+          if [ -z "$RELEASE_ID" ]; then
+            echo "::error::拿不到 release id"
+            exit 1
+          fi
+          echo "release_id=$RELEASE_ID"
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "tag_version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  # Job 2: 并行构建各平台,上传产物到 draft release
   build:
     needs: create-release
+    runs-on: ${{ matrix.platform }}
+    env:
+      # 更新包签名用的 ed25519 私钥(不是 Apple/Windows 的代码签名证书)
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # 公钥不是密钥,放 repository variable 方便随时核对
+      TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
     strategy:
       fail-fast: false
+      # 必须串行:tauri-action 生成 latest.json 时会「下载已有的 → 合并本平台 → 重新上传」,
+      # 四个平台同时跑会互相覆盖,最后留下的清单只含一个平台。
+      max-parallel: 1
       matrix:
         include:
           - platform: "macos-latest"
@@ -57,20 +127,59 @@ jobs:
           - platform: "windows-latest"
             args: ""
 
-    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 手动触发时用输入的 tag;push tag 触发时该表达式为空,
+          # checkout 会退回本次事件自身的 ref(即刚推上去的 tag)。
+          ref: ${{ inputs.tag }}
+
+      - name: Verify updater signing secrets and public key
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 用 ${{ ... }} 表达式比较,而不是把密钥本身插进脚本:
+          # 私钥内容是带换行的多行文本,直接内插会把脚本拆坏(且会落进日志)。
+          if [ "${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}" != "true" ]; then
+            echo "::error::缺少 repository secret TAURI_SIGNING_PRIVATE_KEY —— 没有它不会生成 .sig，latest.json 也无法生成"
+            exit 1
+          fi
+          if [ -z "${TAURI_UPDATER_PUBLIC_KEY}" ]; then
+            echo "::error::缺少 repository variable TAURI_UPDATER_PUBLIC_KEY —— 应用需要它校验更新签名(见 README「自动更新」)"
+            exit 1
+          fi
+
+          # 公钥与「生成更新产物」都在这里注入,仓库里留的是安全默认值:
+          #   pubkey 为空        → 本地构建不会因为「有公钥没私钥」而失败
+          #   createUpdaterArtifacts=false → 本地没私钥就不该假装能签名
+          # 谁发布谁注入,避免把密钥硬编码进源码。
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          conf_path = pathlib.Path("src-tauri/tauri.conf.json")
+          conf = json.loads(conf_path.read_text())
+          conf.setdefault("bundle", {})["createUpdaterArtifacts"] = True
+          updater = conf.setdefault("plugins", {}).setdefault("updater", {})
+          updater["pubkey"] = os.environ["TAURI_UPDATER_PUBLIC_KEY"]
+          conf_path.write_text(json.dumps(conf, indent=2, ensure_ascii=False) + "\n")
+          print("injected updater pubkey, length:", len(os.environ["TAURI_UPDATER_PUBLIC_KEY"]))
+          PY
 
       - name: Set version from tag
         shell: bash
+        env:
+          TAG_VERSION: ${{ needs.create-release.outputs.tag_version }}
         run: |
-          # 从 tag 提取版本号(如 v1.3.7 → 1.3.7),写入 tauri.conf.json 和 package.json
-          VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+          # tag 经由 env 传入,不在脚本里内插表达式
+          VERSION="$TAG_VERSION"
           echo "Version: $VERSION"
           sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
           sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" package.json
           sed -i.bak "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
-          cat src-tauri/tauri.conf.json | grep version
+          grep '"version"' src-tauri/tauri.conf.json
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -115,8 +224,105 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
         with:
-          tagName: ${{ github.ref_name }}
-          # 不设 releaseName/releaseBody/releaseDraft,避免重复创建
-          # tauri-action 会找到上面 softprops 已创建的 Release 并上传产物
+          # 只给 releaseId,不给 tagName:让 tauri-action 认准那个 draft,
+          # 并把清单里的下载地址写成 releases/latest/download/<bundle>
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          # 生成/合并 latest.json(应用内的更新器就是读它)
+          includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+  # Job 3: 清单齐全才把 draft 转正
+  publish-release:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify combined latest.json before publishing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          release_id: ${{ needs.create-release.outputs.release_id }}
+          tag: ${{ needs.create-release.outputs.tag }}
+          tag_version: ${{ needs.create-release.outputs.tag_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p verify
+
+          # 用 release id 直连 API 复核这条 release 仍是 draft:
+          # 后面的 gh release edit 只能按 tag 操作,若别人已经抢先发布,
+          # draft 状态变了就说明这次流水线不该再往下走。
+          is_draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" --jq '.draft')"
+          if [ "$is_draft" != "true" ]; then
+            echo "::error::release $release_id 已不是 draft(当前 draft=$is_draft)，中止"
+            exit 1
+          fi
+
+          # draft 里的 latest.json 不会出现在 releases/latest,必须显式取
+          gh release download "$tag" --pattern latest.json --dir verify --clobber
+
+          if ! python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          path = pathlib.Path("verify/latest.json")
+          if not path.exists():
+              print("::error::raw::latest.json 不存在")
+              sys.exit(1)
+
+          manifest = json.loads(path.read_text())
+          expected_version = os.environ["tag_version"]
+          platforms = manifest.get("platforms") or {}
+          problems = []
+
+          if manifest.get("version") != expected_version:
+              problems.append(f"version 应为 {expected_version},实际 {manifest.get('version')!r}")
+
+          # 四个平台必须齐全 —— 少一个就意味着某台机器收不到更新
+          for key in ("darwin-x86_64", "darwin-aarch64", "windows-x86_64", "linux-x86_64"):
+              entry = platforms.get(key)
+              if not entry:
+                  problems.append(f"缺少平台 {key}")
+                  continue
+              if not entry.get("signature"):
+                  problems.append(f"{key} 没有 signature(签名密钥没配好?)")
+              url = entry.get("url") or ""
+              if not url.startswith("https://"):
+                  problems.append(f"{key} 的 url 不是 https: {url!r}")
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::latest.json {problem}")
+              sys.exit(1)
+
+          print("latest.json 校验通过:", json.dumps(
+              {k: v.get("url") for k, v in sorted(platforms.items())}, indent=2
+          ))
+          PY
+          then
+            echo "::error::latest.json 未通过校验，Release 保持 draft 不发布"
+            exit 1
+          fi
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          release_id: ${{ needs.create-release.outputs.release_id }}
+          tag: ${{ needs.create-release.outputs.tag }}
+          tag_version: ${{ needs.create-release.outputs.tag_version }}
+        run: |
+          set -euo pipefail
+          # 上一步已确认 latest.json 四个平台齐全且带 signature。
+          # 转正前 Release 对 releases/latest 不可见,所以不会有用户拿到半成品。
+          python3 - <<'PY'
+          import json
+          import pathlib
+          manifest = json.loads(pathlib.Path("verify/latest.json").read_text())
+          print("latest.json version =", manifest.get("version"),
+                "platforms =", sorted((manifest.get("platforms") or {}).keys()))
+          PY
+          gh release edit "$tag" --draft=false --latest
+          echo "已发布 v$tag_version (release id $release_id)"

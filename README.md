@@ -17,6 +17,77 @@
 
 > ⚠️ 运行时需要系统已安装 [Node.js](https://nodejs.org/)(自带 `npx`)。装了 [pnpm](https://pnpm.io/) 会优先使用 `pnpm dlx`,没装则自动回退到 `npx -y`。
 
+> 🔃 装好之后就**不用再回来下安装包**了:桌面壳会自己检查新版本并原地升级
+> (见[自动更新](#自动更新))。手动下载始终可用,`.deb` / `.rpm` 安装的场景也走这条路。
+
+## 自动更新
+
+桌面壳内置两条更新通道,优先走官方通道,不可用时自动退化:
+
+| 通道 | 触发 | 行为 |
+|---|---|---|
+| 官方通道 | 启动后自动检查(菜单可关)、菜单「配置 → 检查更新…」 | 读 Release 上的 `latest.json`,按本机 target 取「下载地址 + 签名」→ 下载 → **minisign 校验** → 原地替换 → 重启 |
+| 兜底通道 | 官方通道不可用(典型:本机自建包没注入签名公钥) | 查 GitHub Release API,按系统/架构在资产名里挑出本机该下的包,只提示并打开下载页,不动本机文件 |
+
+「本机该下哪个包」由 target 决定,不需要用户自己认:
+
+| 本机 | `latest.json` 里的 key | 官方通道实际下载 |
+|---|---|---|
+| macOS Intel | `darwin-x86_64` | `*_x64.app.tar.gz` |
+| macOS Apple Silicon | `darwin-aarch64` | `*_aarch64.app.tar.gz` |
+| Windows | `windows-x86_64` | `*-setup.exe`(NSIS,被动模式带进度条) |
+| Linux | `linux-x86_64` | `*.AppImage` |
+
+`.deb` / `.rpm` 不走官方通道 —— Tauri 的更新器不接管包管理器,这类安装会落到兜底通道,
+提示你去下载页取对应的 deb/rpm。
+
+### 为什么必须配签名密钥
+
+Tauri 的更新器**强制**校验更新包签名,验不过就拒绝安装 —— 这是为了防止有人往
+`latest.json` 里塞一个自己编译的包。密钥是独立于 Apple / Windows 代码签名的一对
+ed25519(Minisign)密钥,只需生成一次:
+
+```bash
+# 私钥务必备份:换钥意味着已经装过的用户再也收不到更新
+npx tauri signer generate -w ~/.tauri/dsh-app.key
+```
+
+把私钥和公钥分别放到仓库(一次性):
+
+```bash
+gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/dsh-app.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD   # 生成密钥时设了密码才需要
+gh variable set TAURI_UPDATER_PUBLIC_KEY < ~/.tauri/dsh-app.key.pub
+```
+
+- `TAURI_SIGNING_PRIVATE_KEY` 是 **secret** —— 只在 CI 里给产物签名,永不进仓库。
+- `TAURI_UPDATER_PUBLIC_KEY` 是 **variable**(公钥不是秘密)—— CI 会把它注入
+  `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`,应用靠它验签。
+
+私钥**不可找回**:GitHub 的 secret 是只写存储,读不回来。`~/.tauri/dsh-app.key`
+一旦丢失,现有用户就永久收不到更新 —— 换钥意味着所有已安装版本验签失败,只能逐个
+引导手动重装。请把私钥文件备份到本机之外(密码管理器 / 私密仓库 / 加密归档)。
+
+仓库里这两处的默认值是「不签名」(`createUpdaterArtifacts: false` + `pubkey: ""`)。
+这不是随手留的:一旦 `createUpdaterArtifacts` 为 true 而环境里没有私钥,
+连本地 `npx tauri build` 都会直接失败。发布流程负责同时注入公钥并打开这一项。
+
+### 发布流程
+
+推 tag 后由 GitHub Actions 分三段完成,**任何一段不齐都停在 draft**:
+
+1. **create-release** —— 建一个 draft Release(草稿不会被 `releases/latest` 看见)。
+   tag 如果已经发布过则直接失败,拒绝覆盖线上清单。
+2. **build** —— 四个平台**串行**构建,逐个上传并把签名产物合并进同一个 `latest.json`。
+   串行是必须的:`latest.json` 的生成方式是「下载已有的 → 合并本平台 → 重新上传」,
+   并发跑会让清单里只剩最后一个平台。
+3. **publish-release** —— 校验 `latest.json` 里 `darwin-x86_64` / `darwin-aarch64` /
+   `windows-x86_64` / `linux-x86_64` 四个平台齐全、都带 `signature`、url 都是 https,
+   通过后才把 draft 转正。
+
+漏配上面两个 secret/variable 时,构建会在第一步守卫处立刻失败 —— 总比发出去一个
+用户装不上的版本强。
+
 ## 特性
 
 - 🖥️ **独立桌面窗口** — 基于 Tauri v2 + 系统原生 WebView,自带标题栏,像原生 App 一样
@@ -26,6 +97,7 @@
 - 📊 **启动进度可见** — 加载页逐步显示「检查实例 → 解析版本 → 拉起后端 → 等待下载 → 完成认证 → 加载界面」,带实时耗时、进度条,失败时显示后端日志尾部,不再是一个沉默的转圈
 - 🧯 **失败给结论也给建议** — 后端提前退出、缺少包管理器、认证失败、下载超时会被分别识别;错误页直接列出对应的排查步骤,而不是笼统地说"启动失败"
 - 🧹 **按归属清理后端** — 真正退出时只终止本桌面应用启动的完整 `pnpm → node → dsh` 进程树,不影响其他终端任务或复用的外部服务
+- 🔃 **应用内更新** — 启动后自动检查桌面壳新版本(可关),也可随时菜单「配置 → 检查更新…」;按本机系统与架构自动取对应安装包,校验签名后原地替换并重启。详见[自动更新](#自动更新)
 - 🌐 **跨平台** — Windows / macOS / Linux 全支持
 
 ## 工作原理
@@ -176,20 +248,26 @@ npx tauri build
 
 ## CI / 自动发布
 
-本项目使用 GitHub Actions 自动构建和发布:
+本项目使用 GitHub Actions 自动构建和发布(流程详见[发布流程](#发布流程)):
 
-- **打 tag 触发**:推送 `v*` 格式的 tag 自动构建全平台并发布 Release
+- **打 tag 触发**:推送 `v*` 格式的 tag
   ```bash
-  git tag v1.0.0
+  git tag v1.4.13
   git push --tags
   ```
-- **手动触发**:在 [Actions 页面](https://github.com/Attiv/deepseek-harness-desktop/actions) 点 "Run workflow"
+- **手动重跑**:在 [Actions 页面](https://github.com/Attiv/deepseek-harness-desktop/actions)
+  点 "Run workflow" 并填入**已存在**的版本 tag(形如 `v1.4.13`)。
 
-构建矩阵:
+前置条件:Actions 可读的两个凭据必须已经配好,否则构建会在守卫步骤直接失败 ——
+`TAURI_SIGNING_PRIVATE_KEY`(secret)、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`(secret,
+设置私钥密码才需要)、`TAURI_UPDATER_PUBLIC_KEY`(variable)。配置命令见
+[为什么必须配签名密钥](#为什么必须配签名密钥)。
+
+构建矩阵(串行执行,保证 `latest.json` 合并正确):
 - `windows-latest` → NSIS 安装程序 + MSI
 - `macos-latest` (x86_64) → Intel dmg
 - `macos-latest` (aarch64) → Apple Silicon dmg
-- `ubuntu-22.04` → AppImage + deb
+- `ubuntu-22.04` → AppImage + deb + rpm
 
 ## 项目结构
 
@@ -247,6 +325,17 @@ app-dsh-channel: "next"       # 默认:跟预览频道(通常比 latest 新)
 
 菜单「配置 → 版本信息」可查看当前桌面壳版本与生效频道；「配置 → 一键更新全部插件」
 会显示实时更新状态，完成后需完全重启 DSH。
+
+### 关闭启动时自动检查更新
+
+菜单 **配置 → 启动时自动检查更新** 取消勾选即可，等价于在 `~/.dsh/settings.yaml`
+顶层写：
+
+```yaml
+app-auto-check-update: "off"
+```
+
+关掉之后仍可用「配置 → 检查更新…」手动检查。默认是开启的。
 
 三种方式都需**完全退出并重新启动**应用才生效。若 3080 端口上已有其他 dsh 实例
 在运行，应用只会复用它，此时新频道不会生效 —— 需要先停掉那个实例。

@@ -13,6 +13,15 @@ class LauncherCommandTests(unittest.TestCase):
     def setUp(self):
         self.source = SOURCE_PATH.read_text()
 
+    def test_desktop_updater_is_registered_without_webview_permissions(self):
+        import json
+
+        self.assertIn('.plugin(tauri_plugin_updater::Builder::new().build())', self.source)
+        permissions = json.loads(
+            (SOURCE_PATH.parents[1] / 'capabilities/default.json').read_text()
+        )['permissions']
+        self.assertFalse(any(item.startswith('updater:') for item in permissions))
+
     def test_pnpm_dlx_is_not_given_npx_yes_flag(self):
         self.assertNotIn('"pnpm", "dlx", "-y"', self.source)
         self.assertNotIn("pnpm dlx -y ", self.source)
