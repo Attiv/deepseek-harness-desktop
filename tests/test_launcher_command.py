@@ -65,6 +65,45 @@ class LauncherCommandTests(unittest.TestCase):
             "Windows / macOS / Linux 三条回退路径都要带 -y",
         )
 
+    def test_runner_scripts_keep_node_reachable_on_a_clean_path(self):
+        """「找到了 pnpm」不等于「pnpm 跑得起来」。
+
+        pnpm / npx 的 shebang 都是 `#!/usr/bin/env node`。壳由 LaunchServices
+        拉起(Finder/Dock 双击)、而 `zsh -c` 又不是 login shell 时,node 可能落在
+        PATH 之外 —— 这时报的是 `env: node: No such file or directory`,后端照样
+        起不来(本机 node 在 /usr/local/bin,pnpm 在 ~/.npm-global/bin,两者不同目录)。
+
+        补 node 目录必须是**追加**:前插会让 PATH 里更靠前的 runner 失效,
+        连带把「探测顺序」这件事弄坏。
+        """
+        self.assertEqual(
+            self.source.count('DSH_NODE_DIRS="/usr/local/bin:/opt/homebrew/bin"'),
+            2,
+            "macOS 的启动脚本与插件更新脚本都要补 /usr/local/bin 与 /opt/homebrew/bin",
+        )
+        self.assertEqual(
+            self.source.count('DSH_NODE_DIRS="/usr/local/bin"'),
+            2,
+            "Linux 两条路径同样要补",
+        )
+        self.assertEqual(self.source.count("export DSH_NODE_DIRS"), 4)
+        # 启动脚本两条 + 插件更新两条,每处 exec 前都先把 PATH 补好
+        self.assertEqual(
+            self.source.count('PATH="$PATH:$d:$DSH_NODE_DIRS"'),
+            4,
+            "每个 `$d/pnpm` 命中分支都要带上 $d 与 node 目录",
+        )
+        self.assertNotIn('PATH="$DSH_NODE_DIRS:$PATH"', self.source, "node 目录不能前插")
+        self.assertNotIn('PATH="$d:$PATH"', self.source, "pnpm 所在目录也不能前插")
+
+    def test_plugin_update_probes_the_home_install_locations(self):
+        """菜单里的「更新插件」在同一个干净 PATH 下跑,兜底目录不能只在启动路径里有。"""
+        self.assertEqual(
+            self.source.count('"$HOME/.npm-global/bin"'),
+            4,
+            "启动脚本与插件更新脚本、macOS 与 Linux,四处都要探这个目录",
+        )
+
     def test_windows_probes_pnpm_before_choosing_a_runner(self):
         """Windows 用 where 探测后分支,而不是 `pnpm ... || npx ...`。
 
@@ -345,6 +384,74 @@ class LauncherCommandTests(unittest.TestCase):
             r"\bcmd\s*\.\s*process_group\s*\(\s*0\s*\)\s*;",
         )
 
+    def _function_body(self, signature):
+        """从源码里切出一个顶层函数的函数体,便于对实现细节做断言。"""
+        tail = self.source[self.source.index(signature):]
+        return tail[: tail.index("\n}\n") + 3]
+
+    def test_menu_offers_page_reload_as_the_stuck_page_escape_hatch(self):
+        """dsh 前端没有页面内的自愈入口。卡住时壳必须给一个显式的重载动作,
+        否则用户只能重启整个应用(弹出 Modal 挡住侧栏时连「新建会话」都用不了)。
+        """
+        self.assertIn('with_id("reload", "重新加载页面")', self.source)
+        self.assertRegex(
+            self.source,
+            r'"reload"\s*=>\s*reload_main_window\s*\(\s*app\s*\)',
+        )
+        self.assertRegex(self.source, r"\.item\(&reload_item\)")
+
+    def test_reload_reloads_the_document_instead_of_renavigating(self):
+        """navigate 到同一 URL 在部分平台上会被当成 no-op,页面不会重走启动流程。"""
+        body = self._function_body("fn reload_main_window(")
+        self.assertIn('get_webview_window("main")', body)
+        self.assertIn("location.reload()", body)
+
+    def test_reload_is_reachable_from_the_keyboard(self):
+        self.assertIn('.accelerator("CmdOrCtrl+R")', self.source)
+
+    def test_watchdog_is_installed_after_every_dsh_page_load(self):
+        """必须在每次加载完成时重装:reload 出来的是新文档,
+        上一份脚本不会跟着过去,否则自愈只生效一次。"""
+        self.assertRegex(self.source, r"\.on_page_load\s*\(")
+        self.assertIn("tauri::webview::PageLoadEvent::Finished", self.source)
+        self.assertIn("is_dsh_web_url(payload.url().as_str())", self.source)
+        self.assertIn("window.eval(&watchdog_script())", self.source)
+
+    def test_watchdog_does_not_touch_the_local_loading_page(self):
+        """壳自己的加载页没有工作区 UI,注入看门狗只会平添噪音。"""
+        body = self._function_body("fn is_dsh_web_url(")
+        self.assertIn("127.0.0.1", body)
+        self.assertIn("localhost", body)
+        self.assertIn("DSH_PORT", body)
+
+    def test_watchdog_only_watches_the_workspace_dialogs(self):
+        """判据不能退化成「任何 role=status 卡住就刷新」:那会命中
+        「正在生成回复」这类正常长任务,自动刷新会打断正在进行的对话。"""
+        script = self._function_body("fn watchdog_script()")
+        self.assertIn("""querySelectorAll('[role="status"]')""", script)
+        for hint in (
+            "正在删除工作区",
+            "Deleting workspace",
+            "正在加载工作区",
+            "Loading workspaces",
+        ):
+            with self.subTest(hint=hint):
+                self.assertIn(hint, script)
+        self.assertIn("if (!hit) { stuckSince = 0; return; }", script)
+
+    def test_watchdog_cannot_degenerate_into_a_reload_storm(self):
+        """误触的代价必须被封顶:有明确卡住阈值,且有跨 reload 生效的冷却窗。"""
+        script = self._function_body("fn watchdog_script()")
+        self.assertIn("STUCK_MS", script)
+        self.assertIn("COOLDOWN_MS", script)
+        self.assertIn("if (cooling()) return;", script)
+        self.assertIn("sessionStorage.setItem(COOLDOWN_KEY", script)
+        self.assertIn("if (Date.now() - stuckSince < STUCK_MS) return;", script)
+
+    def test_watchdog_is_self_installing_once_per_document(self):
+        script = self._function_body("fn watchdog_script()")
+        self.assertIn("window.__dshWatchdogInstalled", script)
+
 
 class ShellLaunchScriptTests(unittest.TestCase):
     """真跑一遍从 main.rs 抽出的 shell 脚本,验证选路行为而不只是源码文本。
@@ -397,6 +504,14 @@ class ShellLaunchScriptTests(unittest.TestCase):
             )
             return (done.stdout + done.stderr).strip(), done.returncode
 
+    def test_the_extracted_script_carries_no_rust_format_escapes(self):
+        """规格测试直接抽源码文本去跑,不经过 format!。
+
+        所以脚本里出现 `{{` 就是信号:那是 format! 的转义,抽出来 zsh 会报
+        `bad substitution`。要在脚本里写默认值就用 if 判断,别用 ${VAR:-默认}。
+        """
+        self.assertNotIn("{", self.script, "除了 {spec} 不该有别的花括号")
+
     def test_pnpm_is_preferred_when_present(self):
         output, code = self.run_script("pnpm", "npx")
         self.assertEqual(output, f"STUB-PNPM dlx {self.SPEC} web --no-open")
@@ -412,6 +527,157 @@ class ShellLaunchScriptTests(unittest.TestCase):
         output, code = self.run_script()
         self.assertEqual(code, 127)
         self.assertIn("neither pnpm nor npx found", output)
+
+    def test_finds_pnpm_installed_under_the_home_fallback(self):
+        """复现「Finder/Dock 双击启动」的真实环境:壳由 LaunchServices 拉起,
+        PATH 是干净的;而脚本用的 `zsh -c` 不是 login shell,不走 path_helper,
+        所以 /etc/paths 里的 /usr/local/bin 也不生效(`command -v npx` 会落空)。
+
+        本机 pnpm 实际装在 ~/.npm-global/bin —— 兜底列表漏了它,后端就直接
+        起不来(日志里是 `neither pnpm nor npx found`)。这个测试钉住那一条。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / ".npm-global" / "bin").mkdir(parents=True)
+            stub = home / ".npm-global" / "bin" / "pnpm"
+            stub.write_text(self.STUB % "GLOBAL")
+            stub.chmod(0o755)
+            done = subprocess.run(
+                [self.shell, "-c", self.script],
+                capture_output=True,
+                text=True,
+                # PATH 只给系统默认目录:没有 pnpm,也没有 /usr/local/bin
+                env={"PATH": "/usr/bin:/bin", "HOME": str(home)},
+                stdin=subprocess.DEVNULL,
+                timeout=30,
+            )
+            output = (done.stdout + done.stderr).strip()
+            self.assertEqual(
+                output,
+                f"STUB-GLOBAL dlx {self.SPEC} web --no-open",
+                "干净 PATH 下必须能从 ~/.npm-global/bin 兜底找到 pnpm",
+            )
+            self.assertEqual(done.returncode, 0)
+
+
+    def test_pnpm_whose_shebang_needs_node_still_runs(self):
+        """`#!/usr/bin/env node` 的 pnpm:node 不在 PATH 里就会 ENOENT。
+
+        精确复现本机实况 —— pnpm 在 ~/.npm-global/bin(账号目录,PATH 里没有),
+        node 在 /usr/local/bin(脚本自己补进去)。stub 的 node 把控制权交回
+        /bin/sh,于是「node 到底有没有被找到」这件事可观测:找不到就没有输出。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / ".npm-global" / "bin").mkdir(parents=True)
+            pnpm = home / ".npm-global" / "bin" / "pnpm"
+            pnpm.write_text('#!/usr/bin/env node\necho "STUB-NODE-PNPM $@"\nexit 0\n')
+            pnpm.chmod(0o755)
+
+            nodedir = Path(tmp) / "nodedir"
+            nodedir.mkdir()
+            node = nodedir / "node"
+            node.write_text('#!/bin/sh\nexec /bin/sh "$@"\n')
+            node.chmod(0o755)
+
+            done = subprocess.run(
+                [self.shell, "-c", self.script],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": str(home),
+                    "DSH_NODE_DIRS": str(nodedir),
+                },
+                stdin=subprocess.DEVNULL,
+                timeout=30,
+            )
+            output = (done.stdout + done.stderr).strip()
+            self.assertEqual(
+                output,
+                f"STUB-NODE-PNPM dlx {self.SPEC} web --no-open",
+                "补了 node 目录后,env node 才找得到 node",
+            )
+            self.assertEqual(done.returncode, 0)
+
+    def test_the_added_directories_never_shadow_an_existing_runner(self):
+        """补目录只能追加 —— 前插会让 PATH 里更靠前的 runner 失效。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            bins, home, shadow = (
+                Path(tmp) / "bin",
+                Path(tmp) / "home",
+                Path(tmp) / "shadow",
+            )
+            for d in (bins, home, shadow):
+                d.mkdir()
+            for where, name in ((bins, "PICKED"), (shadow, "SHADOW")):
+                stub = where / "pnpm"
+                stub.write_text(self.STUB % name)
+                stub.chmod(0o755)
+
+            done = subprocess.run(
+                [self.shell, "-c", self.script],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": f"{bins}:/usr/bin:/bin",
+                    "HOME": str(home),
+                    "DSH_NODE_DIRS": str(shadow),
+                },
+                stdin=subprocess.DEVNULL,
+                timeout=30,
+            )
+            output = (done.stdout + done.stderr).strip()
+            self.assertEqual(
+                output,
+                f"STUB-PICKED dlx {self.SPEC} web --no-open",
+                "PATH 里原有的 pnpm 必须优先于后补目录里的同名命令",
+            )
+
+
+class PluginUpdateScriptTests(unittest.TestCase):
+    """菜单里的「更新插件」是另一条脚本,同样在壳的干净 PATH 下执行。"""
+
+    STUB = ShellLaunchScriptTests.STUB
+
+    @classmethod
+    def setUpClass(cls):
+        if sys.platform != "darwin":
+            raise unittest.SkipTest("这里的脚本是 macOS 分支")
+        source = SOURCE_PATH.read_text()
+        start = source.index('#[cfg(target_os = "macos")]\nfn plugin_update_command(')
+        cls.script = re.search(r'r#"(.*?)"#', source[start:], re.DOTALL).group(1)
+        cls.shell = "/bin/zsh"
+
+    def test_update_finds_home_pnpm_with_node_reachable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / ".npm-global" / "bin").mkdir(parents=True)
+            pnpm = home / ".npm-global" / "bin" / "pnpm"
+            pnpm.write_text('#!/usr/bin/env node\necho "STUB-NODE-PNPM $@"\nexit 0\n')
+            pnpm.chmod(0o755)
+
+            nodedir = Path(tmp) / "nodedir"
+            nodedir.mkdir()
+            node = nodedir / "node"
+            node.write_text('#!/bin/sh\nexec /bin/sh "$@"\n')
+            node.chmod(0o755)
+
+            done = subprocess.run(
+                [self.shell, "-c", self.script],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": str(home),
+                    "DSH_NODE_DIRS": str(nodedir),
+                },
+                stdin=subprocess.DEVNULL,
+                timeout=30,
+            )
+            output = (done.stdout + done.stderr).strip()
+            self.assertEqual(output, "STUB-NODE-PNPM update")
+            self.assertEqual(done.returncode, 0)
 
 
 if __name__ == "__main__":

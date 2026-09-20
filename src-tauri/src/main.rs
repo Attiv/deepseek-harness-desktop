@@ -764,18 +764,44 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
         // macOS: 用户的 pnpm 通常在 zsh 的 PATH 里(sh 读不进 .zshrc 的 zsh 语法,
         // 也带不出 nvm/volta 这些)。桌面 shell 不能凭空假设 PATH,所以用 zsh 加载
         // 用户的完整环境来执行,并兜底补常见 pnpm 安装位置。
+        //
+        // ⚠ 这段脚本文本经 `format!` 展开:**除了占位符,里面不许出现任何花括号**。
+        //   写一个左花括号会直接编译不过;双写虽然能编译,但
+        //   tests/test_launcher_command.py 是**直接抽取源码里的脚本文本**去真跑的
+        //   (并不经过 format!),抽出来的双花括号会让 zsh 报 `bad substitution` ——
+        //   一个只在跑测试时才冒出来的怪错。要写 shell 的「变量默认值」,用
+        //   `[ -n "$VAR" ] || VAR=默认值` 这种没有花括号的写法。
+        //   脚本里的注释同理,别举花括号的例子。
         let script = format!(
-            r#"if command -v pnpm >/dev/null 2>&1; then
+            r#"# 壳是被 LaunchServices 拉起来的(Finder/Dock 双击),拿到的是干净 PATH;
+# 而这条 zsh -c 不是 login shell,不走 path_helper,于是 /etc/paths 里的
+# /usr/local/bin 也不生效。要拉起后端,下面两件事必须同时成立:
+#   1) 找得到 pnpm/npx —— 显式列常见安装目录(本机 pnpm 在 ~/.npm-global/bin);
+#   2) 找得到 node   —— pnpm/npx 的 shebang 都是 `#!/usr/bin/env node`,找到了
+#      pnpm 却把 node 落在 PATH 外,报的只是 `env: node: No such file or directory`,
+#      后端照样起不来(本机 node 装在 /usr/local/bin)。
+# node 目录一律**追加**到 PATH 末尾:追加不会遮蔽 PATH 里已有的命令,所以不会
+# 让更靠前的 runner 失效,同时保证 node 可见。自定义布局(nvm/asdf/macports)
+# 可用 DSH_NODE_DIRS 覆盖。(默认值的写法见上面那条花括号注意事项)
+[ -n "$DSH_NODE_DIRS" ] || DSH_NODE_DIRS="/usr/local/bin:/opt/homebrew/bin"
+export DSH_NODE_DIRS
+if command -v pnpm >/dev/null 2>&1; then
+  PATH="$PATH:$DSH_NODE_DIRS"
   pnpm dlx {spec} web --no-open
   exit $?
 fi
-# pnpm 不在当前 PATH —— zsh + 常用安装路径都补一版,再找不到才退 npx
-for d in "$HOME/.local/share/pnpm" "$HOME/.tesh" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
-  [ -n "$d" ] && [ -x "$d/pnpm" ] && exec "$d/pnpm" dlx {spec} web --no-open
+# pnpm 不在当前 PATH —— 把常用安装路径都探一版,再找不到才退 npx
+for d in "$HOME/.local/share/pnpm" "$HOME/.npm-global/bin" "$HOME/.tesh" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
+  if [ -n "$d" ] && [ -x "$d/pnpm" ]; then
+    # $d 也追加进去:node 与 pnpm 同目录的布局(volta/nvm)才找得到 node
+    PATH="$PATH:$d:$DSH_NODE_DIRS"
+    exec "$d/pnpm" dlx {spec} web --no-open
+  fi
 done
 # 没有 pnpm 就用 Node 自带的 npx。`-y` 必须带:否则它会问 "Ok to proceed? (y)",
 # 而桌面壳没有 stdin 可答,升级时就会一直挂着。
 if command -v npx >/dev/null 2>&1; then
+  PATH="$PATH:$DSH_NODE_DIRS"
   exec npx -y {spec} web --no-open
 fi
 echo "ERROR: neither pnpm nor npx found. Install Node.js (https://nodejs.org) or pnpm (https://pnpm.io/installation)" >&2
@@ -801,12 +827,22 @@ exit 127"#,
         let script = format!(
             r#"[ -f "$HOME/.profile" ] && . "$HOME/.profile" 2>/dev/null || true
 [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null || true
+# GUI 启动的进程同样拿不到登录 shell 的 PATH,而 pnpm/npx 的 shebang 是
+# `#!/usr/bin/env node` —— node 不在 PATH 里时,pnpm 找到了也跑不起来。
+# 一律**追加** node 目录(追加不遮蔽已有命令),可用 DSH_NODE_DIRS 覆盖。
+# 默认值的写法见 macOS 分支的花括号注意事项。
+[ -n "$DSH_NODE_DIRS" ] || DSH_NODE_DIRS="/usr/local/bin"
+export DSH_NODE_DIRS
 if command -v pnpm >/dev/null 2>&1; then
+  PATH="$PATH:$DSH_NODE_DIRS"
   pnpm dlx {spec} web --no-open
   exit $?
 fi
-for d in "$HOME/.local/share/pnpm" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
-  [ -n "$d" ] && [ -x "$d/pnpm" ] && exec "$d/pnpm" dlx {spec} web --no-open
+for d in "$HOME/.local/share/pnpm" "$HOME/.npm-global/bin" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
+  if [ -n "$d" ] && [ -x "$d/pnpm" ]; then
+    PATH="$PATH:$d:$DSH_NODE_DIRS"
+    exec "$d/pnpm" dlx {spec} web --no-open
+  fi
 done
 # 没有 pnpm 就用 Node 自带的 npx。`-y` 必须带:否则它会问 "Ok to proceed? (y)",
 # 而桌面壳没有 stdin 可答,升级时就会一直挂着。
@@ -1571,12 +1607,20 @@ fn plugin_update_command(profile: &Path) -> Command {
 
 #[cfg(target_os = "macos")]
 fn plugin_update_command(profile: &Path) -> Command {
+    // 与启动脚本同一个坑:壳的 PATH 是干净的,而要跑起来的 pnpm/npx 的 shebang
+    // 是 `#!/usr/bin/env node`。这里同样补齐安装目录与 node 目录,否则菜单里的
+    // 「更新插件」直接以 `neither pnpm nor npx found` 收场。
     let mut command = Command::new("zsh");
     command
         .args([
             "-c",
-            r#"if command -v pnpm >/dev/null 2>&1; then exec pnpm update; fi
-if command -v npx >/dev/null 2>&1; then exec npx -y pnpm update; fi
+            r#"[ -n "$DSH_NODE_DIRS" ] || DSH_NODE_DIRS="/usr/local/bin:/opt/homebrew/bin"
+export DSH_NODE_DIRS
+if command -v pnpm >/dev/null 2>&1; then PATH="$PATH:$DSH_NODE_DIRS"; exec pnpm update; fi
+for d in "$HOME/.local/share/pnpm" "$HOME/.npm-global/bin" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
+  if [ -n "$d" ] && [ -x "$d/pnpm" ]; then PATH="$PATH:$d:$DSH_NODE_DIRS"; exec "$d/pnpm" update; fi
+done
+if command -v npx >/dev/null 2>&1; then PATH="$PATH:$DSH_NODE_DIRS"; exec npx -y pnpm update; fi
 echo 'ERROR: neither pnpm nor npx found' >&2; exit 127"#,
         ])
         .current_dir(profile);
@@ -1589,8 +1633,13 @@ fn plugin_update_command(profile: &Path) -> Command {
     command
         .args([
             "-c",
-            r#"if command -v pnpm >/dev/null 2>&1; then exec pnpm update; fi
-if command -v npx >/dev/null 2>&1; then exec npx -y pnpm update; fi
+            r#"[ -n "$DSH_NODE_DIRS" ] || DSH_NODE_DIRS="/usr/local/bin"
+export DSH_NODE_DIRS
+if command -v pnpm >/dev/null 2>&1; then PATH="$PATH:$DSH_NODE_DIRS"; exec pnpm update; fi
+for d in "$HOME/.local/share/pnpm" "$HOME/.npm-global/bin" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
+  if [ -n "$d" ] && [ -x "$d/pnpm" ]; then PATH="$PATH:$d:$DSH_NODE_DIRS"; exec "$d/pnpm" update; fi
+done
+if command -v npx >/dev/null 2>&1; then PATH="$PATH:$DSH_NODE_DIRS"; exec npx -y pnpm update; fi
 echo 'ERROR: neither pnpm nor npx found' >&2; exit 127"#,
         ])
         .current_dir(profile);
@@ -1864,6 +1913,10 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
 
     let toggle_item = MenuItemBuilder::with_id("toggle", format!("显示/隐藏窗口 ({})", current_shortcut))
         .build(app).map_err(|e| e.to_string())?;
+    // 卡住时的逃生口:dsh 前端没有页面内的自愈入口,以前只能重启整个应用。
+    let reload_item = MenuItemBuilder::with_id("reload", "重新加载页面")
+        .accelerator("CmdOrCtrl+R")
+        .build(app).map_err(|e| e.to_string())?;
     let set_shortcut_item = MenuItemBuilder::with_id("set-shortcut", "设置快捷键…")
         .build(app).map_err(|e| e.to_string())?;
     let export_no_cred = MenuItemBuilder::with_id("export-no-cred", "导出配置(不含 API Keys)")
@@ -1908,6 +1961,7 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
 
     let config_submenu = SubmenuBuilder::new(app, "配置")
         .item(&toggle_item)
+        .item(&reload_item)
         .item(&set_shortcut_item)
         .separator()
         .item(&channel_submenu)
@@ -1951,6 +2005,17 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         app.set_menu(menu).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// 重新加载主窗口页面 —— 卡住时的手动逃生口。
+///
+/// 用 `location.reload()` 而不是把窗口 `navigate` 到同一 URL:后者在部分平台上
+/// 会被当成 no-op,页面根本不会重新走一遍启动流程。重新加载会重建推送连接,
+/// 界面状态随之与服务端对齐,这正是卡在 pending 时需要的。
+fn reload_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.eval("window.location.reload();");
+    }
 }
 
 /// 关闭快捷键设置窗口
@@ -2266,6 +2331,73 @@ fn auth_fallback_script() -> String {
     )
 }
 
+/// 判断某个已完成的页面是不是 dsh web 自己那页。
+///
+/// 壳里有两个文档要加载:自己的本地加载页(`tauri://localhost` / `http://tauri.localhost`)
+/// 和导航过去的 dsh web(`127.0.0.1:3080`)。看门狗只对后者有意义。
+fn is_dsh_web_url(url: &str) -> bool {
+    let port = DSH_PORT;
+    ["127.0.0.1", "localhost"].iter().any(|host| {
+        url.starts_with(&format!("http://{host}:{port}"))
+            || url.starts_with(&format!("https://{host}:{port}"))
+    })
+}
+
+/// 工作区弹窗卡死时的自愈脚本 —— 每次 dsh 页面加载完成后由壳注入(见 `on_page_load`)。
+///
+/// 为什么需要它:dsh web 的界面状态绑在推送流上。工作区列表只从那条
+/// WebSocket(`/api/remote.mux`) 更新,长连接一旦静默断开,后端其实仍在正常工作,
+/// 界面却会永久停在某个 pending 上 —— 典型是删除工作区后停在「正在删除工作区…」。
+/// 而那个弹窗的关闭逻辑开头是 `if (deleting) return;`,卡住时点关闭/ESC/遮罩
+/// 全部无效,Modal 又挡住侧栏(连带「新建会话」也用不了),只能重启整个应用。
+///
+/// 判据刻意只盯**工作区弹窗自己的 pending 文案**,不去匹配通用的 `role="status"`:
+/// 后者会命中「正在生成回复」这类正常的长任务,自动刷新会打断正在进行的对话。
+/// 冷却窗口则保证即使判据误触,也不会退化成刷新风暴。
+fn watchdog_script() -> String {
+    r#"(function () {
+  if (window.__dshWatchdogInstalled) return;
+  window.__dshWatchdogInstalled = true;
+
+  var POLL_MS = 5000;
+  var STUCK_MS = 45000;
+  var COOLDOWN_MS = 600000;
+  var COOLDOWN_KEY = "__dshWatchdogReloadAt";
+  var HINTS = ["正在删除工作区", "Deleting workspace",
+               "正在加载工作区", "Loading workspaces"];
+
+  var stuckSince = 0;
+
+  function pendingText() {
+    var nodes = document.querySelectorAll('[role="status"]');
+    var text = "";
+    for (var i = 0; i < nodes.length; i++) text += (nodes[i].textContent || "") + "\n";
+    return text;
+  }
+
+  function cooling() {
+    var last = 0;
+    try { last = Number(sessionStorage.getItem(COOLDOWN_KEY)) || 0; } catch (e) { last = 0; }
+    return Date.now() - last < COOLDOWN_MS;
+  }
+
+  setInterval(function () {
+    var text = pendingText();
+    var hit = false;
+    for (var i = 0; i < HINTS.length; i++) {
+      if (text.indexOf(HINTS[i]) !== -1) { hit = true; break; }
+    }
+    if (!hit) { stuckSince = 0; return; }
+    if (stuckSince === 0) { stuckSince = Date.now(); return; }
+    if (Date.now() - stuckSince < STUCK_MS) return;
+    if (cooling()) return;
+    try { sessionStorage.setItem(COOLDOWN_KEY, String(Date.now())); } catch (e) {}
+    window.location.reload();
+  }, POLL_MS);
+})();"#
+        .to_string()
+}
+
 /// The boot loop uses blocking HTTP and thread sleeps, so it must not run as an
 /// async task. Without an await, reqwest's oneshot polls eventually exhaust the
 /// task's cooperative budget and park forever, bypassing even the boot deadline.
@@ -2345,6 +2477,17 @@ fn main() {
             .min_inner_size(900.0, 600.0)
             .center()
             .visible(false)
+            // 每次页面加载完成(含看门狗/菜单触发的 reload)都重装一次看门狗,
+            // 否则自愈只有第一次生效 —— 新文档里没有上一份脚本。
+            .on_page_load(|window, payload| {
+                if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                    return;
+                }
+                if !is_dsh_web_url(payload.url().as_str()) {
+                    return;
+                }
+                let _ = window.eval(&watchdog_script());
+            })
             .build()?;
 
             let child = if probe_dsh() == DshState::Down {
@@ -2616,6 +2759,7 @@ fn main() {
                 "export-no-cred" => do_export(app, false),
                 "export-cred" => do_export(app, true),
                 "import" => do_import(app),
+                "reload" => reload_main_window(app),
                 "update-plugins" => update_web_profile_plugins(app),
                 "check-update" => check_for_updates(app, true),
                 "auto-check-update" => toggle_auto_check_update(app),
@@ -2659,6 +2803,40 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_the_dsh_web_page_but_not_the_local_shell_page() {
+        for dsh_page in [
+            "http://127.0.0.1:3080/",
+            "http://127.0.0.1:3080/?token=abc",
+            "http://localhost:3080/",
+        ] {
+            assert!(is_dsh_web_url(dsh_page), "应识别为 dsh 页面: {dsh_page}");
+        }
+        for other in [
+            "tauri://localhost/index.html",
+            "http://tauri.localhost/index.html",
+            "http://tauri.localhost/shortcut-input.html",
+            "http://127.0.0.1:9999/",
+            "https://example.com/",
+        ] {
+            assert!(!is_dsh_web_url(other), "不该注入看门狗: {other}");
+        }
+    }
+
+    #[test]
+    fn watchdog_script_survives_its_raw_string_wrapper() {
+        // 脚本是 r#"..."# 里的 JS,一旦正文里出现 "# 就会被提前截断,
+        // 注入到页面里只剩半截 —— 那时看门狗静默失效,不会有任何报错。
+        let script = watchdog_script();
+        assert!(script.starts_with("(function () {"), "IIFE 头被截断了");
+        assert!(script.trim_end().ends_with("})();"), "IIFE 尾被截断了");
+        assert!(script.contains("__dshWatchdogInstalled"));
+        assert!(script.contains("location.reload()"));
+        // reload 的判据与冷却都必须在,否则要么不生效、要么变成刷新风暴
+        assert!(script.contains("STUCK_MS"));
+        assert!(script.contains("COOLDOWN_MS"));
+    }
 
     #[test]
     fn startup_worker_can_poll_past_the_async_cooperative_budget() {
