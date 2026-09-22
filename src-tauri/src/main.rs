@@ -394,6 +394,8 @@ enum BootFailure {
     NotReady,
     /// 频道指向的那个版本在 npm 上根本装不起来 —— 上游某个子包没跟着发。
     ChannelUnavailable,
+    /// 版本装上了,但装配插件树时某个插件抛错,后端直接退出。
+    PluginTreeFailed,
 }
 
 impl BootFailure {
@@ -404,6 +406,7 @@ impl BootFailure {
             BootFailure::AuthRejected => "DSH 认证失败",
             BootFailure::NotReady => "DSH 启动超时",
             BootFailure::ChannelUnavailable => "上游这个版本装不上",
+            BootFailure::PluginTreeFailed => "插件与当前 dsh 不兼容",
         }
     }
 
@@ -427,6 +430,12 @@ impl BootFailure {
             BootFailure::ChannelUnavailable => {
                 "当前频道指向的 dsh 版本依赖了一个还没发布的子包,pnpm 因此报 \
 ERR_PNPM_NO_MATCHING_VERSION —— 这是上游发布缺件,不是你机器的问题。"
+                    .to_string()
+            }
+            BootFailure::PluginTreeFailed => {
+                "dsh 本体已经装上了,但它在装配插件树时抛错并退出 —— 某个已装插件调用的 \
+dsh 内部 API 在当前版本上已经变了。这是插件与版本不匹配,不是网络或 Node 的问题, \
+换频道通常也治不了。"
                     .to_string()
             }
         }
@@ -462,6 +471,12 @@ ERR_PNPM_NO_MATCHING_VERSION —— 这是上游发布缺件,不是你机器的�
                 r#"用 <code>npm view @deepseek-ai/dsh dist-tags</code> 看各频道现在指向哪个版本;日志 <code>~/.dsh/.dsh-app-launcher.log</code> 里 pnpm 会写明缺的是哪个子包"#.to_string(),
                 "上游一般几小时内会补发缺的子包,补上之后可以再切回 <code>next</code>".to_string(),
             ],
+            BootFailure::PluginTreeFailed => vec![
+                r#"错误页下面那几行 <code>插件id (包名): Error: …</code> 就是装载失败的插件,拿包名去对应仓库看有没有适配当前 dsh 的版本"#.to_string(),
+                r#"不想等更新就先禁用:在 <code>~/.dsh/profiles/web/package.json</code> 的 <code>dsh.profile.bundles</code> 里删掉那一项,再从菜单「配置 → 退出 DeepSeek Harness」彻底退出并重新打开本应用"#.to_string(),
+                r#"权限档名冲突是最常见的一类:dsh 0.1.6 起把 <code>auto</code> 变成了保留名,自建权限档的插件必须改掉自己的 <code>presetName</code>"#.to_string(),
+                r#"想看完整名单就手动跑 <code>pnpm dlx @deepseek-ai/dsh@latest web --no-open</code>,它会一次列出所有装载失败的插件"#.to_string(),
+            ],
         }
     }
 }
@@ -472,6 +487,14 @@ ERR_PNPM_NO_MATCHING_VERSION —— 这是上游发布缺件,不是你机器的�
 fn classify_boot_failure(log: &str, had_child: bool) -> BootFailure {
     if log.contains("neither pnpm nor npx found") {
         return BootFailure::MissingRunner;
+    }
+    // 装是装上了,但插件树没装配起来:某个已装插件调用的 dsh API 在当前版本上变了。
+    // 这类失败**不能**触发频道回退 —— 换频道治不了插件不兼容,2026-09-22 实测回退到
+    // alpha 反而一次炸掉四个插件。所以放在 ERR_PNPM 判断之前单独归类。
+    // EADDRINUSE 必须排除:端口被占时 dsh 用的是同一句「plugin tree failed to load」,
+    // 但根因是端口冲突,归到插件头上会把用户引向完全错误的方向。
+    if log.contains("plugin tree failed to load") && !log.contains("EADDRINUSE") {
+        return BootFailure::PluginTreeFailed;
     }
     if had_child && log.contains("启动 dsh 失败") {
         return BootFailure::RunnerExited;
@@ -494,6 +517,8 @@ struct BootFailureReport {
 }
 
 impl BootFailureReport {
+    /// `log` 必须是**本次尝试**的日志(调用方用 [`current_attempt_log`] 切好)。
+    /// 展示的日志尾部也只在本次尝试里取,免得把上一次的报错一起摊给用户看。
     fn from_log(kind: BootFailure, log: &str, had_child: bool, timeout_secs: u64, detail: &str) -> Self {
         let steps = if kind == BootFailure::NotReady {
             // 拉起了后端却一直没就绪,最常见的是卡在下载上,把登录页的
@@ -507,7 +532,7 @@ impl BootFailureReport {
             reason: kind.reason(timeout_secs),
             detail: detail.to_string(),
             steps,
-            log: tail_launcher_log(40),
+            log: tail_lines(log, 40),
         }
     }
 }
@@ -572,6 +597,31 @@ fn probe_dsh() -> DshState {
         .unwrap_or(DshState::Down)
 }
 
+/// 每次拉起后端时写下的分隔行前缀。日志是**追加**的(v1.4.15 起),靠它把
+/// 「本次尝试」和上一次隔开 —— 读日志的地方都必须只用分隔行之后的部分。
+const LAUNCH_SEPARATOR: &str = "===== 启动于 ";
+
+/// 只取**本次尝试**写下的那段日志。
+///
+/// 追加式日志里留着上一次的报错。分类器若对整段尾部做子串匹配,上次的
+/// `ERR_PNPM_NO_MATCHING_VERSION` 就会把这次的「插件树加载失败」误判成上游缺件 ——
+/// 实测 2026-09-22:0.1.6-alpha.2 其实**装成功了**,死在 permission 配置上,
+/// 壳却打了「频道装不上(ERR_PNPM_NO_MATCHING_VERSION)」并白白换了一次频道。
+fn current_attempt_log(text: &str) -> &str {
+    match text.rfind(LAUNCH_SEPARATOR) {
+        Some(index) => &text[index..],
+        // 没有分隔行(极早期版本的日志、或只截到最后一次尝试的中段)时按原文处理
+        None => text,
+    }
+}
+
+/// 一段文本的最后 n 行,供失败页展示。
+fn tail_lines(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
 /// launch token 的字符集:上游把 32 字节随机数做 base64url 编码。
 fn is_launch_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
@@ -590,7 +640,7 @@ fn parse_launch_token(log: &str) -> Option<String> {
     // Logs are appended across runs. Never redeem an old process's token while
     // the current process is starting, or after it has printed a fresh token.
     for line in log.lines().rev() {
-        if line.trim_start().starts_with("===== 启动于 ") {
+        if line.trim_start().starts_with(LAUNCH_SEPARATOR) {
             break;
         }
         let Some(rest) = line.trim_start().strip_prefix("dsh web: ") else {
@@ -872,7 +922,7 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
     if let Ok(mut marker) = log_file.try_clone() {
         let _ = writeln!(
             marker,
-            "\n===== 启动于 {} =====",
+            "\n{LAUNCH_SEPARATOR}{} =====",
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
         );
     }
@@ -2745,7 +2795,9 @@ fn main() {
                     }
 
                     if let Some(reason) = child_exited.clone() {
-                        let log = tail_launcher_log(80);
+                        // 只喂本次尝试的日志:追加式日志里留着上一次的报错,
+                        // 整段匹配会把上一次的缺件错误算到这一次头上。
+                        let log = current_attempt_log(&tail_launcher_log(160)).to_string();
                         let kind = classify_boot_failure(&log, had_child);
 
                         // 上游把子包发漏了 → 这个 tag 在 npm 上根本装不起来。故障完全在
@@ -2889,7 +2941,7 @@ fn main() {
                             // 端口有响应但换不到 cookie:等待解决不了问题。
                             BootFailure::AuthRejected
                         } else {
-                            classify_boot_failure(&log, had_child)
+                            classify_boot_failure(current_attempt_log(&log), had_child)
                         };
                         let detail = format!(
                             "阶段 {} · 已等待 {}s · 日志 {}{}",
@@ -3583,6 +3635,49 @@ mod tests {
         );
     }
 
+    /// 装上了、但插件树炸了:必须单独归类,**且不得触发频道回退**。
+    ///
+    /// 2026-09-22 实测:回退到 `alpha` 并不会让插件复活,而是一次炸四个
+    /// (permission / client-masquerade / reasoning-effort / prompt-optimizer)。
+    #[test]
+    fn a_broken_plugin_tree_is_not_blamed_on_the_channel() {
+        let log = "\
+===== 启动于 2026-09-22 19:05:33 =====\n\
+Progress: resolved 550, reused 234, added 482, done\n\
+Error: dsh: plugin tree failed to load: failed to apply loader entry typert-loader \
+(@deepseek-ai/dsh-typert-loader): typert-loader: 1 typert contributor(s) failed to register\n";
+        assert_eq!(
+            classify_boot_failure(current_attempt_log(log), true),
+            BootFailure::PluginTreeFailed
+        );
+        assert_ne!(
+            BootFailure::PluginTreeFailed,
+            BootFailure::ChannelUnavailable,
+            "插件不兼容不能走频道回退"
+        );
+        assert!(
+            BootFailure::PluginTreeFailed
+                .steps()
+                .iter()
+                .any(|step| step.contains("bundles")),
+            "得告诉用户怎么把那个插件摘掉,否则只能干等上游"
+        );
+    }
+
+    /// 端口被占时 dsh 用的是同一句「plugin tree failed to load」——根因不同,
+    /// 归到插件不兼容上会把用户引向完全错误的方向。
+    #[test]
+    fn a_port_clash_is_not_read_as_a_plugin_incompatibility() {
+        let log = "Error: dsh: plugin tree failed to load: failed to apply loader entry \
+                   webserver (@deepseek-ai/dsh-host-webserver): listen EADDRINUSE: \
+                   address already in use 127.0.0.1:3080\n";
+        assert_ne!(
+            classify_boot_failure(log, true),
+            BootFailure::PluginTreeFailed,
+            "端口占用不是插件问题"
+        );
+    }
+
     /// 回退链必须覆盖所有频道、且永不包含当前这个,否则「重试」只是把同一个
     /// 装不上的版本再装一遍。
     #[test]
@@ -3651,6 +3746,61 @@ mod tests {
         let log = "Progress: resolved 143, reused 138, downloaded 3, added 0\n\
                    ERR_PNPM_FETCH_404  GET https://registry.npmjs.org/x: Not Found\n";
         assert_eq!(classify_boot_failure(log, true), BootFailure::NotReady);
+    }
+
+    /// 追加式日志里留着上一次尝试的报错 —— 分类必须只看**本次**那一段。
+    ///
+    /// 2026-09-22 实测:`0.1.6-alpha.2` 其实**装成功了**(482 包 done),死在
+    /// permission 配置上;而分类器把上一段 `next` 失败的
+    /// `ERR_PNPM_NO_MATCHING_VERSION` 算到它头上,报成「上游这个版本装不上」,
+    /// 还白白换了一次频道。
+    #[test]
+    fn a_stale_upstream_error_does_not_misclassify_the_next_attempt() {
+        let log = "\
+===== 启动于 2026-09-22 19:02:30 =====\n\
+ERR_PNPM_NO_MATCHING_VERSION  No matching version found for x@^0.1.5-rc.3\n\
+\n\
+===== 启动于 2026-09-22 19:05:33 =====\n\
+Progress: resolved 550, reused 234, added 482, done\n\
+Error: permission: \"auto\" is reserved and cannot name a configured preset\n";
+
+        let attempt = current_attempt_log(log);
+        assert!(
+            !attempt.contains("ERR_PNPM_NO_MATCHING_VERSION"),
+            "上一次的缺件报错不该留在本次这一段里:\n{attempt}"
+        );
+        assert_ne!(
+            classify_boot_failure(attempt, true),
+            BootFailure::ChannelUnavailable,
+            "这次的失败不是上游缺件,不能据此换频道"
+        );
+        // 反面:整段喂进去必然误判 —— 这正是修复前的行为,留着防止它退化回去
+        assert_eq!(
+            classify_boot_failure(log, true),
+            BootFailure::ChannelUnavailable
+        );
+    }
+
+    /// 切片以**最后一处**分隔行为界;没有分隔行时原样返回,不做截断。
+    #[test]
+    fn the_current_attempt_starts_at_the_last_separator() {
+        let single = "===== 启动于 2026-09-22 10:00:00 =====\nhello\n";
+        assert!(current_attempt_log(single).starts_with(LAUNCH_SEPARATOR));
+
+        let none = "no separator here\n";
+        assert_eq!(current_attempt_log(none), none);
+
+        let two = "===== 启动于 1 =====\nold\n===== 启动于 2 =====\nnew\n";
+        assert!(current_attempt_log(two).contains("new"));
+        assert!(!current_attempt_log(two).contains("old"));
+    }
+
+    /// 失败页只摊开本次尝试的日志尾部。
+    #[test]
+    fn the_failure_page_shows_the_last_lines_of_the_current_attempt() {
+        assert_eq!(tail_lines("a\nb\nc\n", 2), "b\nc");
+        assert_eq!(tail_lines("a\n", 9), "a");
+        assert_eq!(tail_lines("", 3), "");
     }
 
     /// spawn 直接失败时日志里只有一行「启动 dsh 失败」,不能再报「端口超时」。

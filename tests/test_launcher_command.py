@@ -264,6 +264,33 @@ class LauncherCommandTests(unittest.TestCase):
             "候选频道要集中声明,且 next / latest / alpha 都在链上",
         )
 
+    def test_the_attempt_separator_is_defined_once(self):
+        """写日志与读日志必须共用同一个分隔行常量。
+
+        日志是追加写的,分类器只能看「本次尝试」那一段。分隔行的字面量若在写的地方
+        与读的地方各写一遍,改一处就会让另一处静默失效 —— 症状是把上一次尝试的报错
+        算到这一次头上(2026-09-22 实测过一次:0.1.6-alpha.2 明明装成功了,壳却报
+        「上游这个版本装不上」并多换了一次频道)。
+        """
+        self.assertRegex(
+            self.source,
+            r'const LAUNCH_SEPARATOR:\s*&str\s*=\s*"===== 启动于 "',
+            "分隔行要有唯一常量",
+        )
+        spawn = self._spawn_dsh_body()
+        self.assertIn("{LAUNCH_SEPARATOR}", spawn, "写分隔行要用常量插值")
+        self.assertNotIn(
+            "===== 启动于 {} =====",
+            spawn,
+            "不该再硬编码字面量,否则读写会漂移",
+        )
+        worker = self._boot_worker_body()
+        self.assertIn(
+            "current_attempt_log",
+            worker,
+            "分类前必须切到本次尝试的日志",
+        )
+
     def test_shell_settings_are_not_written_into_dsh_config(self):
         """壳把自己的设置写进 dsh 的 settings.yaml 是错的。
 
