@@ -138,11 +138,48 @@ fn upsert_top_level_setting(content: &str, key: &str, value: &str) -> String {
     new_lines.join("\n") + "\n"
 }
 
-/// 从 ~/.dsh/settings.yaml 读一个顶层标量字段。
-/// 字段缺失、文件不存在、值为空都返回 None。
+/// 壳自己的设置文件(相对于 ~/.dsh)。
+///
+/// 为什么不继续用 dsh 的 `settings.yaml`:那是 **dsh 的文件**,dsh 有权搬迁它。
+/// 0.1.7-alpha.1 起 `@deepseek-ai/dsh-settings` 会把 `settings.yaml` 改名成
+/// `settings.yaml.imported` 并把 section 搬进当前 profile —— 壳把自己的
+/// `app-shortcut` / `app-dsh-channel` 寄存在那里面,于是用户跑一次新版 dsh,
+/// 快捷键和频道选择就静默回到默认值(实测 2026-09-22:用户设的 `Alt+E` 丢失)。
+/// 放到壳独占的文件里,dsh 再怎么迁移都动不到它。
+const APP_SETTINGS_FILE: &str = ".dsh-app-settings.yaml";
+
+/// 读设置时的候选来源,按优先级排列。
+///
+/// 1. 壳自己的文件 —— 权威来源,写也只写这里。
+/// 2. `settings.yaml` —— 旧位置,兼容还没搬过来的老用户。
+/// 3. `settings.yaml.imported` —— 已被 dsh 迁移走的那份。留着这一层是为了让
+///    "刚被 dsh 迁走、用户还没重新选过" 的窗口期不至于丢设置。
+fn app_setting_sources(home: &Path) -> Vec<PathBuf> {
+    vec![
+        app_settings_write_path(home),
+        home.join("settings.yaml"),
+        home.join("settings.yaml.imported"),
+    ]
+}
+
+/// 写入目标。读的第一来源复用它,所以「写进去读不出来」在结构上就不可能发生。
+fn app_settings_write_path(home: &Path) -> PathBuf {
+    home.join(APP_SETTINGS_FILE)
+}
+
+/// 按顺序找**第一个含该顶层键**的值 —— 不是第一个存在的文件,
+/// 否则壳的文件里只写了快捷键时,会把 settings.yaml 里的频道一起挡掉。
+fn read_setting_from(sources: &[PathBuf], key: &str) -> Option<String> {
+    sources
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .find_map(|content| parse_top_level_setting(&content, key))
+}
+
+/// 读一个顶层标量字段。字段缺失、文件不存在、值为空都返回 None。
+/// 三个来源都找过才算没有(见 [`app_setting_sources`])。
 fn read_setting(key: &str) -> Option<String> {
-    let content = fs::read_to_string(dsh_home().join("settings.yaml")).ok()?;
-    parse_top_level_setting(&content, key)
+    read_setting_from(&app_setting_sources(&dsh_home()), key)
 }
 
 /// 读取快捷键配置(~/.dsh/settings.yaml 里的 app-shortcut 字段)
@@ -157,7 +194,10 @@ fn read_shortcut() -> String {
     })
 }
 
-/// 写入一个顶层标量配置项到 ~/.dsh/settings.yaml。
+/// 写入一个顶层标量配置项到壳自己的 ~/.dsh/.dsh-app-settings.yaml。
+///
+/// **不能写回 dsh 的 `settings.yaml`**:那样 dsh 的下一次迁移又会把它改名搬走,
+/// 等于每跑一次新版 dsh 就把用户的设置清一次(见 [`APP_SETTINGS_FILE`])。
 ///
 /// 只替换顶层的同名键,嵌套子键不受影响。文件不存在时创建一个只含该键的新文件。
 ///
@@ -171,7 +211,7 @@ fn write_setting_value(key: &str, value: &str) -> Result<(), String> {
         return Err(format!("非法的配置键: {key:?}"));
     }
 
-    let settings = dsh_home().join("settings.yaml");
+    let settings = app_settings_write_path(&dsh_home());
     let content = fs::read_to_string(&settings).unwrap_or_default();
 
     if let Some(parent) = settings.parent() {
@@ -181,7 +221,7 @@ fn write_setting_value(key: &str, value: &str) -> Result<(), String> {
     fs::write(&settings, upsert_top_level_setting(&content, key, value)).map_err(|e| e.to_string())
 }
 
-/// 写入快捷键配置到 ~/.dsh/settings.yaml
+/// 写入快捷键配置到壳自己的设置文件
 fn write_shortcut(shortcut: &str) -> Result<(), String> {
     write_setting_value("app-shortcut", shortcut)
 }
@@ -413,13 +453,13 @@ ERR_PNPM_NO_MATCHING_VERSION —— 这是上游发布缺件,不是你机器的�
             BootFailure::NotReady => vec![
                 r#"首次启动或切换版本要下载约 220 MB,请确认网络能访问 npm 源;必要时配置镜像 <code>~/.npmrc</code>"#.to_string(),
                 r#"在终端手动执行 <code>pnpm dlx @deepseek-ai/dsh@latest web --no-open</code>,确认它能否单独跑通"#.to_string(),
-                r#"把 <code>~/.dsh/settings.yaml</code> 里的 <code>app-dsh-channel</code> 固定到某个已知可用版本(如 <code>0.1.5-rc.2</code>)再重启"#.to_string(),
+                r#"把 <code>~/.dsh/.dsh-app-settings.yaml</code> 里的 <code>app-dsh-channel</code> 固定到一个当前能装的确切版本再重启"#.to_string(),
                 r#"查看日志文件 <code>~/.dsh/.dsh-app-launcher.log</code>"#.to_string(),
             ],
             BootFailure::ChannelUnavailable => vec![
-                r#"菜单「配置 → DSH 频道」切到 <code>latest</code>(稳定版),再用「配置 → 退出 DeepSeek Harness」彻底退出后重新打开"#.to_string(),
-                r#"或直接在 <code>~/.dsh/settings.yaml</code> 把 <code>app-dsh-channel</code> 固定成一个能装的版本(如 <code>0.1.5-rc.2</code>)再重启"#.to_string(),
-                r#"日志文件 <code>~/.dsh/.dsh-app-launcher.log</code> 里 pnpm 会写明缺的是哪个包,可拿去催上游或对照 npm 上的版本"#.to_string(),
+                r#"壳已经把 <code>next</code> / <code>latest</code> / <code>alpha</code> 逐个试过了,都装不上 —— 说明上游这几个频道同时发坏了,不是你机器的问题"#.to_string(),
+                r#"菜单「配置 → DSH 频道」可在这些频道之间切换;也可在 <code>~/.dsh/.dsh-app-settings.yaml</code> 把 <code>app-dsh-channel</code> 固定成一个当前能装的确切版本"#.to_string(),
+                r#"用 <code>npm view @deepseek-ai/dsh dist-tags</code> 看各频道现在指向哪个版本;日志 <code>~/.dsh/.dsh-app-launcher.log</code> 里 pnpm 会写明缺的是哪个子包"#.to_string(),
                 "上游一般几小时内会补发缺的子包,补上之后可以再切回 <code>next</code>".to_string(),
             ],
         }
@@ -475,6 +515,7 @@ impl BootFailureReport {
 /// 需要导出的配置项(相对于 ~/.dsh)
 const EXPORT_ITEMS: &[&str] = &[
     "settings.yaml",
+    APP_SETTINGS_FILE,
     "cordis.patch.yml",
     ".credentials.yaml",
     ".anonymous-user-id",
@@ -708,27 +749,59 @@ fn pick_newest_tag(tags: &serde_json::Map<String, serde_json::Value>) -> Option<
 /// 它常常落后于 `next`(实测 latest=0.1.5-rc.1、next=0.1.5-rc.2)。跟 `latest`
 /// 会让桌面壳长期停在旧版,而这正是"客户端表现异常、必须退回终端手跑 @next"的成因。
 /// 想退出预览频道可在菜单「配置 → DSH 频道」里切回 `latest`。
-/// 当前频道装不上时改用的备选 spec。
+const DEFAULT_CHANNEL: &str = "next";
+
+/// 频道装不上时按这个顺序依次改用的候选(回退时跳过当前在用的那个)。
+///
+/// `alpha` 必须在列 —— 2026-09-22 上游把 `0.1.5-rc.3` 的子包发漏了:`next` 直接
+/// 装不上;而 `latest`(0.1.5-rc.2)依赖 `dsh-web-app: ^0.1.5-rc.2`,caret 范围允许
+/// 同段更高的预发布版,于是它向上浮到了坏掉的 `0.1.5-rc.3`,把 `latest` 一起拖下水。
+/// 实测那一刻唯一装得上的就剩 `alpha`。少列一个频道,回退链就会在真实故障里走空。
+const CHANNEL_FALLBACK_ORDER: &[&str] = &["next", "latest", "alpha"];
+
+/// 当前频道装不上时,依次改用的备选 spec(已排除当前这个)。
 ///
 /// 只在 `ERR_PNPM_NO_MATCHING_VERSION` 这类「上游某个子包没跟着发」的故障下用:
 /// 那种情况换一个**不同**的 tag 才有意义,同一个装不上的版本重试多少次都一样。
-/// 首选稳定频道 `latest`;本来就在 `latest` 上才反过来试 `next`。
-fn fallback_dsh_spec(current: &str) -> Option<String> {
-    let alternative = if current.contains("@latest") {
-        "next"
-    } else {
-        "latest"
-    };
-    let spec = format!("{DSH_PACKAGE}@{alternative}");
-    (spec != current).then_some(spec)
+/// 返回的是一条链而不是一个值 —— 上游一次发坏多个频道时,只退一步同样走不通。
+fn fallback_dsh_specs(current: &str) -> Vec<String> {
+    CHANNEL_FALLBACK_ORDER
+        .iter()
+        .map(|channel| format!("{DSH_PACKAGE}@{channel}"))
+        .filter(|spec| spec != current)
+        .collect()
 }
 
-const DEFAULT_CHANNEL: &str = "next";
+/// 从 spec(如 `@deepseek-ai/dsh@alpha`)里取出频道名,给状态行和日志用。
+fn channel_tag(spec: &str) -> String {
+    spec.rsplit('@').next().unwrap_or(spec).to_string()
+}
 
-/// 菜单里可选的两个频道。顺序即菜单顺序,第一项是默认值。
+/// 回退说明。一处都没回退过就是空串。
+///
+/// 列出整条链而不是只写落点:连退两次时用户得知道中间跳过了哪些频道,
+/// 否则看到「已回退到 alpha」会以为是自己当初选错了频道。
+fn fallback_note_for(hops: &[String]) -> String {
+    if hops.is_empty() {
+        return String::new();
+    }
+    // `alpha` 是迭代最激进的一条线,第三方 profile 插件常常还没跟上。
+    // 2026-09-22 实测:回退到 alpha(0.1.7-alpha.1)后,用户自研插件的 settings API
+    // 全部不兼容,`workspace/create` 这类核心 RPC 直接返回 definition-unavailable ——
+    // 3080 有响应并不等于能用。这时必须提前说明,否则用户会把插件的报错算到壳头上。
+    let caveat = if hops.iter().any(|hop| hop == "alpha") {
+        "(alpha 迭代最激进,第三方插件可能不兼容)"
+    } else {
+        ""
+    };
+    format!("已回退到 {}{caveat};", hops.join(" → "))
+}
+
+/// 菜单里可选的频道。顺序即菜单顺序,第一项是默认值。
 const SELECTABLE_CHANNELS: &[(&str, &str)] = &[
     ("next", "next(预览版,默认)"),
     ("latest", "latest(稳定版)"),
+    ("alpha", "alpha(最新,迭代最激进)"),
 ];
 
 /// 频道是否属于菜单里可选的那两个。
@@ -755,9 +828,10 @@ fn configured_channel() -> String {
 
 /// 决定这次启动喂给 pnpm 的 spec。
 ///
-/// 默认 `next`(见 [`DEFAULT_CHANNEL`]);可在 `~/.dsh/settings.yaml` 用
-/// `app-dsh-channel` 覆盖成 `latest` / `newest` / 精确版本如 `0.1.5-rc.2`,
+/// 默认 `next`(见 [`DEFAULT_CHANNEL`]);可在 `~/.dsh/.dsh-app-settings.yaml` 用
+/// `app-dsh-channel` 覆盖成 `latest` / `alpha` / `newest` / 精确版本,
 /// 也可以从菜单「配置 → DSH 频道」直接切换。
+/// 旧位置 `~/.dsh/settings.yaml` 仍会被读(见 [`app_setting_sources`]),但写入只写新文件。
 ///
 /// 为什么传 tag 而不是精确版本:pnpm 的缓存目录按 spec 哈希。传 tag 时所有版本
 /// 共用一个目录(dsh 约 220 MB),由 pnpm 原地升级;传精确版本会每发一版就多一个
@@ -1530,7 +1604,7 @@ async fn offer_manual_download(app: &tauri::AppHandle, manual: bool) -> Result<(
     Ok(())
 }
 
-/// 切换「启动时自动检查更新」。写进 ~/.dsh/settings.yaml 顶层,重启后仍生效。
+/// 切换「启动时自动检查更新」。写进壳自己的设置文件顶层,重启后仍生效。
 fn toggle_auto_check_update(app: &tauri::AppHandle) {
     let next = if auto_check_update_enabled() { "off" } else { "on" };
 
@@ -1949,7 +2023,9 @@ fn switch_channel(app: &tauri::AppHandle, channel: &str) {
     if let Err(error) = write_setting_value("app-dsh-channel", channel) {
         show_status(
             app,
-            &format!("写入频道配置失败: {error}\n请检查 ~/.dsh/settings.yaml 的写入权限。"),
+            &format!(
+                "写入频道配置失败: {error}\n请检查 ~/.dsh/.dsh-app-settings.yaml 的写入权限。"
+            ),
             "error",
         );
         return;
@@ -2008,7 +2084,7 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .accelerator("CmdOrCtrl+Q")
         .build(app).map_err(|e| e.to_string())?;
 
-    // 频道切换:勾选当前生效的那个,点击即写入 ~/.dsh/settings.yaml
+    // 频道切换:勾选当前生效的那个,点击即写入壳自己的设置文件
     let active_channel = configured_channel();
     let mut channel_builder = SubmenuBuilder::new(app, "DSH 频道");
     let mut channel_items = Vec::new();
@@ -2555,8 +2631,8 @@ fn main() {
             })
             .build()?;
 
-            // 备选频道在 if 之外声明:启动 worker 是另一个闭包,要把它 move 进去。
-            let mut fallback_spec = None;
+            // 备选频道链在 if 之外声明:启动 worker 是另一个闭包,要把它 move 进去。
+            let mut fallback_specs: Vec<String> = Vec::new();
             let child = if probe_dsh() == DshState::Down {
                 // 只有真要拉起后端时才去解析版本,复用已在跑的实例不付这次网络开销。
                 // 版本解析是一次 registry 网络请求(最多 5s),spawn 前先告诉加载页,
@@ -2564,9 +2640,9 @@ fn main() {
                 push_boot_progress(&main_window, BootStage::Resolve, 0, "", None);
                 let spec = resolve_dsh_spec();
                 push_boot_progress(&main_window, BootStage::Spawn, 0, &spec, None);
-                // 备选 spec 在这里先算好:启动 worker 一旦发现这个 tag 在上游装不上
-                // (见 BootFailure::ChannelUnavailable),就换它就地重试。
-                fallback_spec = fallback_dsh_spec(&spec);
+                // 备选链在这里先算好:启动 worker 一旦发现这个 tag 在上游装不上
+                // (见 BootFailure::ChannelUnavailable),就顺着它逐个换频道重试。
+                fallback_specs = fallback_dsh_specs(&spec);
                 spawn_dsh(&spec)
             } else {
                 None
@@ -2604,12 +2680,13 @@ fn main() {
                 // 后端是被我们拉起的,进程一旦退出就永远等不到端口 —— 提前报错,
                 // 而不是让用户白等满 10 分钟。
                 let mut child_exited: Option<String> = None;
-                // 还没用过的备选频道。`take()` 掉就没了 —— 自动回退只发生一次,
-                // 两个频道都装不上说明问题不在频道上,那时如实报错更有用。
-                let mut pending_fallback = fallback_spec;
-                // 回退过就把这句话一直挂在状态行上:静默换版本会让用户以为
-                // 自己跑的还是原来那个频道。它在整个等待期间都可见。
-                let mut fallback_note = String::new();
+                // 还没用过的备选频道,按序取用。取空就说明所有频道都试过了 ——
+                // 那时如实报错比继续转圈有用。不能只退一步:上游一次发坏多个频道时
+                // (2026-09-22 就是 next 与 latest 一起坏),单步回退照样走不通。
+                let mut pending_fallbacks = fallback_specs.into_iter();
+                // 实际回退到过的频道(按顺序)。静默换版本会让用户以为自己跑的还是
+                // 原来那个,所以这句话在整个等待期间都挂在状态行上。
+                let mut fallback_hops: Vec<String> = Vec::new();
 
                 loop {
                     let now = Instant::now();
@@ -2627,12 +2704,13 @@ fn main() {
                     let due = last_push.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1));
                     if due {
                         let elapsed = now.duration_since(started).as_secs();
+                        let note = fallback_note_for(&fallback_hops);
                         let detail = match stage {
                             BootStage::Spawn | BootStage::Download => {
-                                format!("{fallback_note}已等待 {elapsed}s")
+                                format!("{note}已等待 {elapsed}s")
                             }
                             // 其他阶段也别把回退这件事藏起来
-                            _ if !fallback_note.is_empty() => fallback_note.clone(),
+                            _ if !note.is_empty() => note.clone(),
                             _ => String::new(),
                         };
                         push_boot_progress(&window, stage, stage.floor_percent(), &detail, None);
@@ -2672,9 +2750,9 @@ fn main() {
 
                         // 上游把子包发漏了 → 这个 tag 在 npm 上根本装不起来。故障完全在
                         // 远端,让用户对着报错自己去切频道,不过是把同一件事手动重做一遍,
-                        // 所以这里直接换另一个频道重试(只一次)。
+                        // 所以这里自己顺着候选链换频道重试,直到试完为止。
                         if kind == BootFailure::ChannelUnavailable {
-                            if let Some(alternative) = pending_fallback.take() {
+                            if let Some(alternative) = pending_fallbacks.next() {
                                 append_launcher_log(&format!(
                                     "[{}] 频道装不上(ERR_PNPM_NO_MATCHING_VERSION),自动回退到 {}\n",
                                     chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
@@ -2696,8 +2774,7 @@ fn main() {
                                         };
                                         // 旧进程已经退出了,直接顶掉,后面的 try_wait 才会盯新的
                                         *guard = spawned.take();
-                                        fallback_note =
-                                            format!("已从装不上的频道回退到 {alternative};");
+                                        fallback_hops.push(channel_tag(&alternative));
                                         // 换 tag 等于一份全新的下载,重新给足时间预算
                                         deadline = Instant::now()
                                             + Duration::from_secs(BOOT_TIMEOUT_SECS);
@@ -2723,10 +2800,11 @@ fn main() {
                             kind
                         };
                         // 回退过就把这件事一并交代清楚,免得以为是单次尝试失败的
-                        let reason = if fallback_note.is_empty() {
+                        let note = fallback_note_for(&fallback_hops);
+                        let reason = if note.is_empty() {
                             reason
                         } else {
-                            format!("{reason} · {fallback_note}")
+                            format!("{reason} · {note}")
                         };
                         let report = BootFailureReport::from_log(
                             kind,
@@ -2818,10 +2896,10 @@ fn main() {
                             stage.id(),
                             timeout_secs,
                             log_path().display(),
-                            if fallback_note.is_empty() {
+                            if fallback_note_for(&fallback_hops).is_empty() {
                                 String::new()
                             } else {
-                                format!(" · {fallback_note}")
+                                format!(" · {}", fallback_note_for(&fallback_hops))
                             }
                         );
                         let report =
@@ -3505,18 +3583,66 @@ mod tests {
         );
     }
 
-    /// 备选频道必须与当前的不同,否则「重试」只是把同一个装不上的版本再装一遍。
+    /// 回退链必须覆盖所有频道、且永不包含当前这个,否则「重试」只是把同一个
+    /// 装不上的版本再装一遍。
     #[test]
-    fn the_fallback_channel_is_always_a_different_one() {
-        let next = fallback_dsh_spec("@deepseek-ai/dsh@next").unwrap();
-        assert!(next.ends_with("@latest"), "next 装不上时该退到稳定频道: {next}");
-        let latest = fallback_dsh_spec("@deepseek-ai/dsh@latest").unwrap();
-        assert!(latest.ends_with("@next"), "latest 自己也装不上时反过来试 next: {latest}");
-        assert_ne!(latest, "@deepseek-ai/dsh@latest");
-        // pin 在某个具体版本上时,备选仍然是稳定频道
-        assert!(fallback_dsh_spec("@deepseek-ai/dsh@0.1.5-rc.2")
-            .unwrap()
-            .ends_with("@latest"));
+    fn the_fallback_chain_never_contains_the_current_channel() {
+        for channel in CHANNEL_FALLBACK_ORDER {
+            let current = format!("{DSH_PACKAGE}@{channel}");
+            let chain = fallback_dsh_specs(&current);
+            assert_eq!(
+                chain.len(),
+                CHANNEL_FALLBACK_ORDER.len() - 1,
+                "{channel} 的回退链漏了频道: {chain:?}"
+            );
+            assert!(!chain.contains(&current), "{channel} 的回退链不该包含自己");
+        }
+    }
+
+    /// `alpha` 必须留在回退链里。2026-09-22 上游把 0.1.5-rc.3 的子包发漏,`next`
+    /// 装不上;`latest` 又因为 caret 上浮撞上同一个缺件,一起躺平 —— 当时只剩
+    /// `alpha` 可用。少了它,自动回退会在真实故障中直接走空。
+    #[test]
+    fn the_fallback_chain_keeps_the_channel_that_still_installs() {
+        for from in ["next", "latest"] {
+            let chain = fallback_dsh_specs(&format!("{DSH_PACKAGE}@{from}"));
+            assert!(
+                chain.iter().any(|spec| spec.ends_with("@alpha")),
+                "{from} 出发的回退链必须能走到 alpha: {chain:?}"
+            );
+        }
+        // pin 在精确版本上时,所有频道都在链上
+        assert_eq!(
+            fallback_dsh_specs(&format!("{DSH_PACKAGE}@0.1.5-rc.2")).len(),
+            CHANNEL_FALLBACK_ORDER.len()
+        );
+    }
+
+    /// 没回退过时说明必须是空串,否则状态行会一直挂着一句没头没尾的话;
+    /// 回退过则要能看出整条链与先后顺序。
+    #[test]
+    fn the_fallback_note_lists_the_whole_chain_or_nothing() {
+        assert!(fallback_note_for(&[]).is_empty());
+        let note = fallback_note_for(&["latest".to_string(), "alpha".to_string()]);
+        assert!(note.contains("latest"), "{note}");
+        assert!(note.contains("alpha"), "{note}");
+        assert!(note.contains('→'), "连退两次要能看出顺序: {note}");
+        // 落到 alpha 上必须带上插件兼容性提示 —— 那不是同一个版本线
+        assert!(note.contains("插件"), "回退到 alpha 要提示插件可能不兼容: {note}");
+    }
+
+    /// 提示只在真的落到 `alpha` 时出现,免得别的回退也被挂上无关的警告。
+    #[test]
+    fn the_alpha_caveat_only_shows_up_when_alpha_is_used() {
+        let safe = fallback_note_for(&["next".to_string(), "latest".to_string()]);
+        assert!(!safe.contains("插件"), "没退到 alpha 就不该提插件: {safe}");
+    }
+
+    /// spec → 频道名的提取,状态行与日志都靠它,别退化成整个 spec。
+    #[test]
+    fn a_channel_tag_is_readable_off_the_spec() {
+        assert_eq!(channel_tag("@deepseek-ai/dsh@alpha"), "alpha");
+        assert_eq!(channel_tag("@deepseek-ai/dsh@0.1.5-rc.2"), "0.1.5-rc.2");
     }
 
     /// 只是慢/需要下载时,不能因为日志里出现过别的 pnpm 错误就误判成上游缺件。
@@ -3708,6 +3834,82 @@ app-dsh-channel: \"latest\"
             Some("latest"),
             "必须读到顶层那个,而不是缩进的同名子键"
         );
+    }
+
+    /// 壳的设置必须存在壳自己的文件里。存进 dsh 的 `settings.yaml` 会被 dsh 的
+    /// 迁移改名搬走(0.1.7-alpha.1 实测:用户的 `Alt+E` 与频道选择一起回到默认值)。
+    #[test]
+    fn shell_settings_live_in_the_shell_owned_file() {
+        let home = Path::new("/tmp/whatever");
+        let sources = app_setting_sources(home);
+        assert_eq!(
+            sources[0].file_name().unwrap(),
+            APP_SETTINGS_FILE,
+            "第一来源必须是壳独占的文件"
+        );
+        assert!(
+            APP_SETTINGS_FILE.starts_with('.'),
+            "避开 dsh 会自行管理的名字"
+        );
+        assert_ne!(APP_SETTINGS_FILE, "settings.yaml", "那是 dsh 的文件");
+        // 写入目标与第一读取来源必须是同一个文件,否则会出现「写了读不到」
+        assert_eq!(
+            app_settings_write_path(home),
+            sources[0],
+            "写入目标必须就是读的第一来源"
+        );
+    }
+
+    /// 优先级:壳自己的文件 > dsh 的 settings.yaml > 被 dsh 改名搬走的 .imported。
+    #[test]
+    fn settings_are_read_from_the_shell_file_before_the_dsh_ones() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-app-settings-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let own = dir.join(APP_SETTINGS_FILE);
+        let dsh = dir.join("settings.yaml");
+        let imported = dir.join("settings.yaml.imported");
+        let sources = app_setting_sources(&dir);
+
+        // 三层都有该键时,壳自己的文件优先
+        fs::write(&own, "app-shortcut: \"Alt+E\"\n").unwrap();
+        fs::write(&dsh, "app-shortcut: \"Cmd+Shift+D\"\n").unwrap();
+        fs::write(&imported, "app-shortcut: \"Ctrl+X\"\n").unwrap();
+        assert_eq!(
+            read_setting_from(&sources, "app-shortcut").as_deref(),
+            Some("Alt+E")
+        );
+
+        // 壳自己的文件里没有这个键时,要接着往下找 —— 不是「有文件就停」
+        assert_eq!(
+            read_setting_from(&sources, "app-dsh-channel").as_deref(),
+            None,
+            "三层都没有该键时才是 None"
+        );
+        fs::write(&dsh, "app-dsh-channel: \"latest\"\n").unwrap();
+        assert_eq!(
+            read_setting_from(&sources, "app-dsh-channel").as_deref(),
+            Some("latest"),
+            "壳的文件存在但没有这个键时,不能被它挡住"
+        );
+
+        // dsh 把 settings.yaml 搬走之后(只剩 .imported),设置不能丢
+        fs::remove_file(&dsh).unwrap();
+        fs::write(&imported, "app-shortcut: \"Alt+E\"\napp-dsh-channel: \"latest\"\n").unwrap();
+        assert_eq!(
+            read_setting_from(&sources, "app-dsh-channel").as_deref(),
+            Some("latest"),
+            "dsh 迁移走 settings.yaml 后仍要能读到,否则用户的频道会静默回到默认值"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 没有顶层键时应返回 None(而不是误取子键)。

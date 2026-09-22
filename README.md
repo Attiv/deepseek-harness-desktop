@@ -92,8 +92,8 @@ gh variable set TAURI_UPDATER_PUBLIC_KEY < ~/.tauri/dsh-app.key.pub
 
 - 🖥️ **独立桌面窗口** — 基于 Tauri v2 + 系统原生 WebView,自带标题栏,像原生 App 一样
 - ⚡ **轻量** — 编译产物约 3 MB(对比 Electron 动辄上百 MB)
-- 🔄 **默认跟随 next 频道** — 避免长期落后于上游预览版；可在菜单「配置 → DSH 频道」一键切回 `latest`(稳定版)。
-  某个频道在上游发布缺件、装不上时,会自动改用另一个频道重试一次,并在加载页说明换了哪个版本
+- 🔄 **默认跟随 next 频道** — 避免长期落后于上游预览版；菜单「配置 → DSH 频道」可在 `next` / `latest` / `alpha` 之间切换。
+  某个频道在上游发布缺件、装不上时,会按 `next → latest → alpha` 逐个换频道重试,并在加载页写明整条回退链
 - 🚀 **智能启动** — 检测已有实例则直接复用,否则后台拉起(无黑框),轮询端口就绪后显示窗口
 - 📊 **启动进度可见** — 加载页逐步显示「检查实例 → 解析版本 → 拉起后端 → 等待下载 → 完成认证 → 加载界面」,带实时耗时、进度条,失败时显示后端日志尾部,不再是一个沉默的转圈
 - 🧯 **失败给结论也给建议** — 后端提前退出、缺少包管理器、认证失败、下载超时会被分别识别;错误页直接列出对应的排查步骤,而不是笼统地说"启动失败"
@@ -111,7 +111,7 @@ gh variable set TAURI_UPDATER_PUBLIC_KEY < ~/.tauri/dsh-app.key.pub
    ↓
 检测 127.0.0.1:3080 是否已有 dsh 在跑?
    ├─ 有 → 窗口直接导航到 dsh 界面(不查版本,零网络开销)
-   └─ 无 → 使用 `next` 预览频道(默认;菜单可切 `latest`)
+   └─ 无 → 使用 `next` 预览频道(默认;菜单可切 `latest` / `alpha`)
             ↓
             后台执行 pnpm dlx @deepseek-ai/dsh@<频道> web --no-open(隐藏窗口)
             ↓
@@ -158,6 +158,7 @@ gh variable set TAURI_UPDATER_PUBLIC_KEY < ~/.tauri/dsh-app.key.pub
 | 后端进程启动失败 | 拉起的进程在监听端口前就退出 | 在终端手动跑一次 `pnpm dlx` 看报错 |
 | DSH 认证失败 | 端口有响应但始终换不到 cookie | 关掉终端里占用 3080 的那个实例 |
 | DSH 启动超时 | 等满 10 分钟仍未就绪 | 检查网络/镜像源,或钉死 `app-dsh-channel` |
+| 上游这个版本装不上 | 日志出现 `ERR_PNPM_NO_MATCHING_VERSION` | 壳已自动换过全部频道;见下方「上游发布缺件」 |
 
 后端是被本应用拉起的,若它起不来,超时后会被**自动终止**,不会留着进程继续占端口。
 错误页会显示实际等待时长、当时所处阶段、日志路径与日志尾部,便于直接定位。
@@ -203,9 +204,36 @@ $ npm view @deepseek-ai/dsh dist-tags
 导致模型选择等 UI 槽位异常,可随时切回 `latest`:
 
 - 菜单 **配置 → DSH 频道 → latest(稳定版)**
-- 或手动在 `~/.dsh/settings.yaml` 写 `app-dsh-channel: "latest"`
+- 或手动在 `~/.dsh/.dsh-app-settings.yaml` 写 `app-dsh-channel: "latest"`
 
 两种方式都需要**完全退出并重新启动**应用后生效。
+
+### 上游发布缺件
+
+dsh 是一个几十个子包的 monorepo,上游偶尔会「主包发了、某个子包没跟上」。这时
+pnpm 会直接判定无解并秒退:
+
+```
+ERR_PNPM_NO_MATCHING_VERSION  No matching version found for
+@deepseek-ai/dsh-client-ui-sidebar-documentpreview@^0.1.5-rc.3
+```
+
+**这不是本机的问题**——重装 Node、换镜像源、清缓存都没用,那个版本在 npm 上不存在。
+
+更麻烦的是它**会一次拖垮多个频道**。2026-09-22 实测:
+
+| 频道 | 指向版本 | 能否安装 |
+|---|---|---|
+| `next` | `0.1.5-rc.3` | ❌ 直接依赖那个从未发布的子包 |
+| `latest` | `0.1.5-rc.2` | ❌ 依赖 `dsh-web-app: ^0.1.5-rc.2`,而 caret 允许同段更高的预发布版,于是向上浮到坏掉的 `0.1.5-rc.3` |
+| `alpha` | `0.1.7-alpha.1` | ✅ |
+
+所以壳不假设「总有一个频道是好的」:遇到这类错误会**顺着 `next → latest → alpha`
+一直试到某个装得成为止**,并把整条回退链写在加载页与日志里。全部试完仍不行才报
+「上游这个版本装不上」,那时错误页会给出查看 dist-tags 的命令。
+
+想省掉每次启动都试一遍前面几个坏频道,可以把 `app-dsh-channel` 直接钉到当前能用的
+那个(如 `alpha`),等上游修好再切回来。
 
 ### 为什么传 tag 而不是精确版本号
 
@@ -315,16 +343,23 @@ python3 -m unittest discover -s tests
 
 ### 切换 DSH 频道
 
-**推荐用菜单**:「配置 → DSH 频道」里勾选 `next`(预览版,默认)或 `latest`(稳定版),
-切换后提示需要完全退出并重启应用。
+**推荐用菜单**:「配置 → DSH 频道」里勾选 `next`(预览版,默认)、`latest`(稳定版)
+或 `alpha`(最新,迭代最激进),切换后提示需要完全退出并重启应用。
 
-也可以直接编辑 `~/.dsh/settings.yaml`:
+也可以直接编辑 `~/.dsh/.dsh-app-settings.yaml`(壳独占的设置文件,首次写入时自动创建)。
+
+> 早期版本把这两个开关混在 dsh 自己的 `~/.dsh/settings.yaml` 里。dsh 从
+> 0.1.7-alpha.1 起会把那个文件改名成 `settings.yaml.imported`(把 section 搬进当前
+> profile),寄存在那里的设置会跟着一起消失 —— 所以壳改用自己独占的文件。
+> 旧位置与 `.imported` 仍会被**读**到,老用户不会因此丢掉已设的频道与快捷键。
 
 ```yaml
+# 文件位于 ~/.dsh/.dsh-app-settings.yaml
 app-dsh-channel: "next"       # 默认:跟预览频道(通常比 latest 新)
 # app-dsh-channel: "latest"   # 只跟官方稳定频道
+# app-dsh-channel: "alpha"    # 跟版本号最高的频道(上游发得最快,也最容易缺件)
 # app-dsh-channel: "newest"   # 自动选版本最高的频道(菜单里不显示,但配置可生效)
-# app-dsh-channel: "0.1.5-rc.2" # 钉死某个版本
+# app-dsh-channel: "0.1.5-rc.3" # 钉死某个版本(该版本必须真能装上)
 ```
 
 菜单「配置 → 版本信息」可查看当前桌面壳版本与生效频道；「配置 → 一键更新全部插件」
@@ -344,7 +379,8 @@ app-auto-check-update: "off"
 三种方式都需**完全退出并重新启动**应用才生效。若 3080 端口上已有其他 dsh 实例
 在运行，应用只会复用它，此时新频道不会生效 —— 需要先停掉那个实例。
 
-> 启动日志位于 `~/.dsh/.dsh-app-launcher.log`。排查时请先备份日志，重启可能覆盖上次启动现场。
+> 启动日志位于 `~/.dsh/.dsh-app-launcher.log`。日志是**追加**写入的（超过 1 MiB 才会
+> 保留一代滚动备份为 `.log.1`），所以重启不会抹掉上次的启动现场，可以放心重启后再看。
 
 ### 其他
 

@@ -159,6 +159,11 @@ class LauncherCommandTests(unittest.TestCase):
         self.assertIn('SubmenuBuilder::new(app, "DSH 频道")', self.source)
         self.assertIn('("next", "next(预览版,默认)")', self.source)
         self.assertIn('("latest", "latest(稳定版)")', self.source)
+        self.assertIn(
+            '("alpha", ',
+            self.source,
+            "alpha 是上游版本最高的频道,也得能在菜单里选",
+        )
         self.assertRegex(
             self.source,
             r'CheckMenuItemBuilder::with_id\(',
@@ -233,19 +238,89 @@ class LauncherCommandTests(unittest.TestCase):
             r'BootFailure::ChannelUnavailable => "上游这个版本装不上"',
         )
 
-    def test_an_uninstallable_channel_is_retried_on_the_other_one(self):
-        """上游把子包发漏时,不该让用户自己对着报错去切频道 —— 壳自己换一个重试。
+    def test_an_uninstallable_channel_is_retried_on_every_remaining_channel(self):
+        """上游把子包发漏时,不该让用户自己对着报错去切频道 —— 壳自己换频道重试。
 
-        只重试一次:两个频道都装不上说明问题不在频道上,那时如实报错更有用。
+        必须能连退多次,不能只退一步:2026-09-22 上游把 `0.1.5-rc.3` 的子包发漏,
+        `next` 装不上;而 `latest`(0.1.5-rc.2)依赖 `dsh-web-app: ^0.1.5-rc.2`,
+        caret 允许同段更高的预发布版,于是向上浮到坏掉的 `0.1.5-rc.3`,一起躺平。
+        当时唯一能装的是 `alpha` —— 只退一步的回退链会直接走空。
         """
         worker = self._boot_worker_body()
         self.assertIn("BootFailure::ChannelUnavailable", worker)
-        self.assertEqual(
-            worker.count("pending_fallback.take()"),
-            1,
-            "备选频道只能被取用一次",
+        self.assertIn(
+            "pending_fallbacks.next()",
+            worker,
+            "备选要逐个取用,而不是只取一次",
         )
-        self.assertEqual(worker.count("spawn_dsh(&alternative)"), 1)
+        self.assertEqual(
+            worker.count("spawn_dsh(&alternative)"),
+            1,
+            "换频道只该有一个落点,否则改一处漏一处",
+        )
+        self.assertRegex(
+            self.source,
+            r'const CHANNEL_FALLBACK_ORDER:\s*&\[&str\]\s*=\s*&\["next",\s*"latest",\s*"alpha"\]',
+            "候选频道要集中声明,且 next / latest / alpha 都在链上",
+        )
+
+    def test_shell_settings_are_not_written_into_dsh_config(self):
+        """壳把自己的设置写进 dsh 的 settings.yaml 是错的。
+
+        dsh 0.1.7-alpha.1 起 `@deepseek-ai/dsh-settings` 会把 settings.yaml 改名成
+        `settings.yaml.imported`,并把 section 搬进当前 profile —— 那是 dsh 自己的文件,
+        它有权这么做。壳的 `app-shortcut` / `app-dsh-channel` 寄存在那里面,于是用户
+        跑一次新版 dsh,快捷键与频道选择就静默回到默认值(2026-09-22 实测:用户设的
+        `Alt+E` 丢过一次)。所以:写只写壳独占的文件,读才做旧位置回退。
+        """
+        self.assertIn(
+            'const APP_SETTINGS_FILE: &str = ".dsh-app-settings.yaml"',
+            self.source,
+            "壳的设置文件必须有独立名字,且是隐藏文件,不跟 dsh 的目录项混在一起",
+        )
+
+        write_body = self.source[
+            self.source.index("fn write_setting_value("):self.source.index("fn write_shortcut(")
+        ]
+        self.assertIn(
+            "app_settings_write_path",
+            write_body,
+            "写入必须走壳独占的路径",
+        )
+        self.assertNotIn(
+            'join("settings.yaml")',
+            write_body,
+            "不允许再写进 dsh 的 settings.yaml —— 会被 dsh 的下一次迁移搬走",
+        )
+
+        read_sources = self.source[
+            self.source.index("fn app_setting_sources("):self.source.index("fn read_setting(")
+        ]
+        self.assertIn('home.join("settings.yaml")', read_sources, "旧位置仍要能读到")
+        self.assertIn(
+            'home.join("settings.yaml.imported")',
+            read_sources,
+            "dsh 迁移走 settings.yaml 之后也要能读回来,否则设置静默丢失",
+        )
+        self.assertIn(
+            "APP_SETTINGS_FILE",
+            self.source[self.source.index("const EXPORT_ITEMS"):self.source.index("const PROFILE_FILES")],
+            "导出的配置包要包含壳自己的设置,否则换机器后频道与快捷键不带过去",
+        )
+
+    def test_the_fallback_chain_records_every_channel_it_skipped(self):
+        """连退两次时只写落点会让用户以为是自己当初选错了频道 —— 整条链都要能看见。"""
+        worker = self._boot_worker_body()
+        self.assertIn(
+            "fallback_hops.push(channel_tag(&alternative))",
+            worker,
+            "每次成功换频道都要记进链里",
+        )
+        self.assertGreaterEqual(
+            worker.count("fallback_note_for(&fallback_hops)"),
+            2,
+            "状态行与失败说明都要带上回退链,不能只在一处显示",
+        )
 
     def test_the_retry_replaces_the_owned_child_so_polling_watches_the_new_one(self):
         """重试必须把新进程写回共享状态 —— 否则 try_wait 还盯着已经退出的旧进程,
