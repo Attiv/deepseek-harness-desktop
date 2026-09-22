@@ -203,6 +203,37 @@ fn log_path() -> PathBuf {
     dsh_home().join(".dsh-app-launcher.log")
 }
 
+/// 追加一行到启动日志 —— **绝不截断**。
+///
+/// 这个文件存在的意义就是「上一次为什么起不来」。用户来报障时往往已经重启过
+/// 好几轮,一旦把上一次的输出抹掉,唯一的证据就没了。实测踩过:上游发了个
+/// 装不上的版本(`ERR_PNPM_NO_MATCHING_VERSION`),重启一次后日志只剩本次输出,
+/// 上一版的报错再也找不回来。所以这里一律 append(`fs::write` 是截断写,不能用)。
+fn append_launcher_log(line: &str) {
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path())
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// 日志只增不减,超过 1 MiB 就把整份挪到 `.1`(只留一代)。
+///
+/// 必须在**打开后端 stdout/stderr 句柄之前**调用:那个句柄认的是 inode,
+/// 中途改名会让后端此后的输出(包括 `dsh web: ...?token=` 那一行)全写进 `.1`,
+/// 而读 token 的代码只读主文件 —— 认证会莫名其妙地失败。
+fn rotate_launcher_log_if_oversized(path: &Path) {
+    const MAX_BYTES: u64 = 1024 * 1024;
+    if fs::metadata(path)
+        .map(|meta| meta.len() > MAX_BYTES)
+        .unwrap_or(false)
+    {
+        let _ = fs::rename(path, path.with_extension("log.1"));
+    }
+}
+
 /// 读取启动日志的末尾若干行,交给加载页展示。
 ///
 /// 日志可能正在被后端进程追加写入,读到半行或读失败都不算错误 —— 拿不到就返回
@@ -321,6 +352,8 @@ enum BootFailure {
     AuthRejected,
     /// 端口等到超时仍未就绪。
     NotReady,
+    /// 频道指向的那个版本在 npm 上根本装不起来 —— 上游某个子包没跟着发。
+    ChannelUnavailable,
 }
 
 impl BootFailure {
@@ -330,6 +363,7 @@ impl BootFailure {
             BootFailure::RunnerExited => "后端进程启动失败",
             BootFailure::AuthRejected => "DSH 认证失败",
             BootFailure::NotReady => "DSH 启动超时",
+            BootFailure::ChannelUnavailable => "上游这个版本装不上",
         }
     }
 
@@ -350,6 +384,11 @@ impl BootFailure {
                 seconds / 60,
                 seconds % 60
             ),
+            BootFailure::ChannelUnavailable => {
+                "当前频道指向的 dsh 版本依赖了一个还没发布的子包,pnpm 因此报 \
+ERR_PNPM_NO_MATCHING_VERSION —— 这是上游发布缺件,不是你机器的问题。"
+                    .to_string()
+            }
         }
     }
 
@@ -377,6 +416,12 @@ impl BootFailure {
                 r#"把 <code>~/.dsh/settings.yaml</code> 里的 <code>app-dsh-channel</code> 固定到某个已知可用版本(如 <code>0.1.5-rc.2</code>)再重启"#.to_string(),
                 r#"查看日志文件 <code>~/.dsh/.dsh-app-launcher.log</code>"#.to_string(),
             ],
+            BootFailure::ChannelUnavailable => vec![
+                r#"菜单「配置 → DSH 频道」切到 <code>latest</code>(稳定版),再用「配置 → 退出 DeepSeek Harness」彻底退出后重新打开"#.to_string(),
+                r#"或直接在 <code>~/.dsh/settings.yaml</code> 把 <code>app-dsh-channel</code> 固定成一个能装的版本(如 <code>0.1.5-rc.2</code>)再重启"#.to_string(),
+                r#"日志文件 <code>~/.dsh/.dsh-app-launcher.log</code> 里 pnpm 会写明缺的是哪个包,可拿去催上游或对照 npm 上的版本"#.to_string(),
+                "上游一般几小时内会补发缺的子包,补上之后可以再切回 <code>next</code>".to_string(),
+            ],
         }
     }
 }
@@ -390,6 +435,11 @@ fn classify_boot_failure(log: &str, had_child: bool) -> BootFailure {
     }
     if had_child && log.contains("启动 dsh 失败") {
         return BootFailure::RunnerExited;
+    }
+    // 上游把子包发漏了:pnpm 直接判定无解,秒退。这种情况给「超时/后端退出」的
+    // 建议纯属误导 —— 用户会去查网络和 Node 版本,而真正要做的是换频道。
+    if log.contains("ERR_PNPM_NO_MATCHING_VERSION") {
+        return BootFailure::ChannelUnavailable;
     }
     BootFailure::NotReady
 }
@@ -658,6 +708,21 @@ fn pick_newest_tag(tags: &serde_json::Map<String, serde_json::Value>) -> Option<
 /// 它常常落后于 `next`(实测 latest=0.1.5-rc.1、next=0.1.5-rc.2)。跟 `latest`
 /// 会让桌面壳长期停在旧版,而这正是"客户端表现异常、必须退回终端手跑 @next"的成因。
 /// 想退出预览频道可在菜单「配置 → DSH 频道」里切回 `latest`。
+/// 当前频道装不上时改用的备选 spec。
+///
+/// 只在 `ERR_PNPM_NO_MATCHING_VERSION` 这类「上游某个子包没跟着发」的故障下用:
+/// 那种情况换一个**不同**的 tag 才有意义,同一个装不上的版本重试多少次都一样。
+/// 首选稳定频道 `latest`;本来就在 `latest` 上才反过来试 `next`。
+fn fallback_dsh_spec(current: &str) -> Option<String> {
+    let alternative = if current.contains("@latest") {
+        "next"
+    } else {
+        "latest"
+    };
+    let spec = format!("{DSH_PACKAGE}@{alternative}");
+    (spec != current).then_some(spec)
+}
+
 const DEFAULT_CHANNEL: &str = "next";
 
 /// 菜单里可选的两个频道。顺序即菜单顺序,第一项是默认值。
@@ -716,6 +781,8 @@ fn resolve_dsh_spec() -> String {
 /// 全程无 stdin,所以任何交互确认都必须提前在环境变量里关掉。
 fn spawn_dsh(spec: &str) -> Option<Child> {
     let log = log_path();
+    // 先滚动过大的日志,再打开后端句柄(顺序反了会把后端输出写进旧文件)。
+    rotate_launcher_log_if_oversized(&log);
     // 用 append 而不是 truncate:上一次启动失败的现场必须留着。
     // 截断会把「客户端为什么卡住」的唯一证据一起抹掉,排查时只剩一片空白。
     let log_file = match fs::OpenOptions::new()
@@ -891,22 +958,20 @@ exit 127"#,
 
     match cmd.spawn() {
         Ok(child) => {
-            let _ = fs::write(
-                &log,
-                format!(
-                    "[{}] dsh 启动中: {} web --no-open (pnpm dlx,缺 pnpm 时回退 npx -y), PID={}\n",
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                    spec,
-                    child.id()
-                ),
-            );
+            append_launcher_log(&format!(
+                "[{}] dsh 启动中: {} web --no-open (pnpm dlx,缺 pnpm 时回退 npx -y), PID={}\n",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                spec,
+                child.id()
+            ));
             Some(child)
         }
         Err(e) => {
-            let _ = fs::write(
-                &log,
-                format!("[{}] 启动 dsh 失败: {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), e),
-            );
+            append_launcher_log(&format!(
+                "[{}] 启动 dsh 失败: {}\n",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                e
+            ));
             None
         }
     }
@@ -2490,6 +2555,8 @@ fn main() {
             })
             .build()?;
 
+            // 备选频道在 if 之外声明:启动 worker 是另一个闭包,要把它 move 进去。
+            let mut fallback_spec = None;
             let child = if probe_dsh() == DshState::Down {
                 // 只有真要拉起后端时才去解析版本,复用已在跑的实例不付这次网络开销。
                 // 版本解析是一次 registry 网络请求(最多 5s),spawn 前先告诉加载页,
@@ -2497,6 +2564,9 @@ fn main() {
                 push_boot_progress(&main_window, BootStage::Resolve, 0, "", None);
                 let spec = resolve_dsh_spec();
                 push_boot_progress(&main_window, BootStage::Spawn, 0, &spec, None);
+                // 备选 spec 在这里先算好:启动 worker 一旦发现这个 tag 在上游装不上
+                // (见 BootFailure::ChannelUnavailable),就换它就地重试。
+                fallback_spec = fallback_dsh_spec(&spec);
                 spawn_dsh(&spec)
             } else {
                 None
@@ -2522,7 +2592,7 @@ fn main() {
             let window = main_window.clone();
             spawn_boot_worker(move || {
                 let started = Instant::now();
-                let deadline = started + Duration::from_secs(BOOT_TIMEOUT_SECS);
+                let mut deadline = started + Duration::from_secs(BOOT_TIMEOUT_SECS);
                 // 后端没在跑时:短暂等待后就把加载页显示出来。切换 spec 或首次安装要下
                 // 约 220 MB,让用户全程盯着空白桌面(甚至怀疑没启动)是不可接受的。
                 let reveal_at = started + Duration::from_secs(if had_child { 3 } else { 0 });
@@ -2534,6 +2604,12 @@ fn main() {
                 // 后端是被我们拉起的,进程一旦退出就永远等不到端口 —— 提前报错,
                 // 而不是让用户白等满 10 分钟。
                 let mut child_exited: Option<String> = None;
+                // 还没用过的备选频道。`take()` 掉就没了 —— 自动回退只发生一次,
+                // 两个频道都装不上说明问题不在频道上,那时如实报错更有用。
+                let mut pending_fallback = fallback_spec;
+                // 回退过就把这句话一直挂在状态行上:静默换版本会让用户以为
+                // 自己跑的还是原来那个频道。它在整个等待期间都可见。
+                let mut fallback_note = String::new();
 
                 loop {
                     let now = Instant::now();
@@ -2553,8 +2629,10 @@ fn main() {
                         let elapsed = now.duration_since(started).as_secs();
                         let detail = match stage {
                             BootStage::Spawn | BootStage::Download => {
-                                format!("已等待 {}s", elapsed)
+                                format!("{fallback_note}已等待 {elapsed}s")
                             }
+                            // 其他阶段也别把回退这件事藏起来
+                            _ if !fallback_note.is_empty() => fallback_note.clone(),
                             _ => String::new(),
                         };
                         push_boot_progress(&window, stage, stage.floor_percent(), &detail, None);
@@ -2591,12 +2669,64 @@ fn main() {
                     if let Some(reason) = child_exited.clone() {
                         let log = tail_launcher_log(80);
                         let kind = classify_boot_failure(&log, had_child);
+
+                        // 上游把子包发漏了 → 这个 tag 在 npm 上根本装不起来。故障完全在
+                        // 远端,让用户对着报错自己去切频道,不过是把同一件事手动重做一遍,
+                        // 所以这里直接换另一个频道重试(只一次)。
+                        if kind == BootFailure::ChannelUnavailable {
+                            if let Some(alternative) = pending_fallback.take() {
+                                append_launcher_log(&format!(
+                                    "[{}] 频道装不上(ERR_PNPM_NO_MATCHING_VERSION),自动回退到 {}\n",
+                                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                                    alternative
+                                ));
+                                push_boot_progress(
+                                    &window,
+                                    BootStage::Resolve,
+                                    0,
+                                    &format!("上一个频道在上游装不上,正在改用 {alternative}"),
+                                    None,
+                                );
+                                let mut spawned = spawn_dsh(&alternative);
+                                match window.app_handle().try_state::<DshChild>() {
+                                    Some(state) if spawned.is_some() => {
+                                        let mut guard = match state.0.lock() {
+                                            Ok(guard) => guard,
+                                            Err(poisoned) => poisoned.into_inner(),
+                                        };
+                                        // 旧进程已经退出了,直接顶掉,后面的 try_wait 才会盯新的
+                                        *guard = spawned.take();
+                                        fallback_note =
+                                            format!("已从装不上的频道回退到 {alternative};");
+                                        // 换 tag 等于一份全新的下载,重新给足时间预算
+                                        deadline = Instant::now()
+                                            + Duration::from_secs(BOOT_TIMEOUT_SECS);
+                                        child_exited = None;
+                                        stage = BootStage::Spawn;
+                                        continue;
+                                    }
+                                    // 拿不到共享状态就别把新进程留在那儿占 3080
+                                    _ => {
+                                        if let Some(mut orphan) = spawned {
+                                            terminate_child_tree(&mut orphan);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // 日志里没写明原因(比如包装脚本自己挂了)时,退到进程退出这一类,
                         // 比「端口超时」更能说明问题。
                         let kind = if kind == BootFailure::NotReady {
                             BootFailure::RunnerExited
                         } else {
                             kind
+                        };
+                        // 回退过就把这件事一并交代清楚,免得以为是单次尝试失败的
+                        let reason = if fallback_note.is_empty() {
+                            reason
+                        } else {
+                            format!("{reason} · {fallback_note}")
                         };
                         let report = BootFailureReport::from_log(
                             kind,
@@ -2684,10 +2814,15 @@ fn main() {
                             classify_boot_failure(&log, had_child)
                         };
                         let detail = format!(
-                            "阶段 {} · 已等待 {}s · 日志 {}",
+                            "阶段 {} · 已等待 {}s · 日志 {}{}",
                             stage.id(),
                             timeout_secs,
-                            log_path().display()
+                            log_path().display(),
+                            if fallback_note.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {fallback_note}")
+                            }
                         );
                         let report =
                             BootFailureReport::from_log(kind, &log, had_child, timeout_secs, &detail);
@@ -3340,6 +3475,56 @@ mod tests {
         let log = "[2026-09-13 10:55:14] dsh 启动中: @deepseek-ai/dsh@latest web --no-open\n\
                    ERROR: neither pnpm nor npx found. Install Node.js (https://nodejs.org) or pnpm\n";
         assert_eq!(classify_boot_failure(log, true), BootFailure::MissingRunner);
+    }
+
+    /// 上游只发了一半(某个子包没跟着发):pnpm 报 ERR_PNPM_NO_MATCHING_VERSION。
+    /// 这不是本机问题,必须指名道姓让人去换频道,而不是含糊地说「后端启动失败」。
+    #[test]
+    fn an_incompletely_published_channel_is_diagnosed_from_the_launcher_log() {
+        let log = "[2026-09-22 14:04:24] dsh 启动中: @deepseek-ai/dsh@next web --no-open\n\
+                   ERR_PNPM_NO_MATCHING_VERSION  No matching version found for \
+                   @deepseek-ai/dsh-client-ui-sidebar-documentpreview@^0.1.5-rc.3\n";
+        assert_eq!(
+            classify_boot_failure(log, true),
+            BootFailure::ChannelUnavailable
+        );
+        // 建议里必须出现「DSH 频道」,否则用户会继续去查网络和 Node 版本
+        assert!(
+            BootFailure::ChannelUnavailable
+                .steps()
+                .iter()
+                .any(|step| step.contains("DSH 频道")),
+            "换频道这条建议不能少"
+        );
+        // 提前退出时调用方会把 NotReady 改判成 RunnerExited —— 这一类比它具体,
+        // 不能被改判掉。
+        assert_ne!(
+            BootFailure::ChannelUnavailable,
+            BootFailure::NotReady,
+            "上游缺件不是「端口超时」"
+        );
+    }
+
+    /// 备选频道必须与当前的不同,否则「重试」只是把同一个装不上的版本再装一遍。
+    #[test]
+    fn the_fallback_channel_is_always_a_different_one() {
+        let next = fallback_dsh_spec("@deepseek-ai/dsh@next").unwrap();
+        assert!(next.ends_with("@latest"), "next 装不上时该退到稳定频道: {next}");
+        let latest = fallback_dsh_spec("@deepseek-ai/dsh@latest").unwrap();
+        assert!(latest.ends_with("@next"), "latest 自己也装不上时反过来试 next: {latest}");
+        assert_ne!(latest, "@deepseek-ai/dsh@latest");
+        // pin 在某个具体版本上时,备选仍然是稳定频道
+        assert!(fallback_dsh_spec("@deepseek-ai/dsh@0.1.5-rc.2")
+            .unwrap()
+            .ends_with("@latest"));
+    }
+
+    /// 只是慢/需要下载时,不能因为日志里出现过别的 pnpm 错误就误判成上游缺件。
+    #[test]
+    fn a_slow_start_is_not_blamed_on_the_upstream_publish() {
+        let log = "Progress: resolved 143, reused 138, downloaded 3, added 0\n\
+                   ERR_PNPM_FETCH_404  GET https://registry.npmjs.org/x: Not Found\n";
+        assert_eq!(classify_boot_failure(log, true), BootFailure::NotReady);
     }
 
     /// spawn 直接失败时日志里只有一行「启动 dsh 失败」,不能再报「端口超时」。

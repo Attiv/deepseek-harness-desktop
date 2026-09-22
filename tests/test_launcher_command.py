@@ -186,6 +186,107 @@ class LauncherCommandTests(unittest.TestCase):
         self.assertIn(".append(true)", spawn, "启动日志必须追加写入")
         self.assertNotIn(".truncate(true)", spawn, "启动日志不能用 truncate")
 
+    def test_every_launcher_log_write_goes_through_the_appending_helper(self):
+        """`fs::write` 同样是截断写 —— 只盯 `.truncate(true)` 字面量会漏掉它。
+
+        实测漏过一次:上游发了个装不上的版本,重启一次后日志里只剩本次输出,
+        上一版的报错再也找不回来(而那正是唯一的排查依据)。
+        """
+        spawn = self._spawn_dsh_body()
+        self.assertIn(
+            "append_launcher_log(",
+            spawn,
+            "写启动日志要走追加 helper:'dsh 启动中' / '启动 dsh 失败' 两处都是",
+        )
+        self.assertNotIn("fs::write(", spawn, "启动流程里不允许出现截断写")
+        self.assertGreaterEqual(
+            spawn.count("append_launcher_log(&format!("),
+            2,
+            "两处日志都要改成追加",
+        )
+
+    def test_oversized_log_rotates_before_the_backend_handle_opens(self):
+        """只增不减的日志要有上限;而滚动必须排在打开后端句柄之前。
+
+        句柄认 inode:中途改名会让后端此后的输出(含 `dsh web: ...?token=` 那行)
+        全写进 `.1`,读 token 的代码却只读主文件 —— 认证会莫名其妙地失败。
+        """
+        spawn = self._spawn_dsh_body()
+        rotate_at = spawn.index("rotate_launcher_log_if_oversized(&log)")
+        handle_at = spawn.index("fs::OpenOptions::new()")
+        self.assertLess(rotate_at, handle_at, "必须先滚动日志再打开后端句柄")
+        self.assertIn(
+            'path.with_extension("log.1")',
+            self.source,
+            "滚动出来的旧日志要有确定的落点",
+        )
+
+    def test_upstream_publish_gap_gets_its_own_failure_kind(self):
+        """上游子包发漏时 pnpm 报 ERR_PNPM_NO_MATCHING_VERSION —— 秒退,不是超时。
+
+        混进「启动超时/后端退出」会让用户去查网络和 Node 版本,而真正要做的是换频道。
+        """
+        self.assertIn("ERR_PNPM_NO_MATCHING_VERSION", self.source)
+        self.assertIn("BootFailure::ChannelUnavailable", self.source)
+        self.assertRegex(
+            self.source,
+            r'BootFailure::ChannelUnavailable => "上游这个版本装不上"',
+        )
+
+    def test_an_uninstallable_channel_is_retried_on_the_other_one(self):
+        """上游把子包发漏时,不该让用户自己对着报错去切频道 —— 壳自己换一个重试。
+
+        只重试一次:两个频道都装不上说明问题不在频道上,那时如实报错更有用。
+        """
+        worker = self._boot_worker_body()
+        self.assertIn("BootFailure::ChannelUnavailable", worker)
+        self.assertEqual(
+            worker.count("pending_fallback.take()"),
+            1,
+            "备选频道只能被取用一次",
+        )
+        self.assertEqual(worker.count("spawn_dsh(&alternative)"), 1)
+
+    def test_the_retry_replaces_the_owned_child_so_polling_watches_the_new_one(self):
+        """重试必须把新进程写回共享状态 —— 否则 try_wait 还盯着已经退出的旧进程,
+        而旧进程永远不会再就绪,回退就成了白等一场。"""
+        worker = self._boot_worker_body()
+        segment = worker[worker.index("spawn_dsh(&alternative)"):]
+        # 整个回退分支(含「拿不到共享状态」那个兜底臂)
+        segment = segment[:segment.index("// 日志里没写明原因")]
+        self.assertIn("try_state::<DshChild>()", segment)
+        self.assertIn("*guard = spawned.take();", segment, "要顶掉已退出的旧进程")
+        self.assertIn(
+            "terminate_child_tree(&mut orphan)",
+            segment,
+            "拿不到共享状态时不能把新进程留在那儿占 3080",
+        )
+
+    def test_the_channel_switch_is_explained_and_gets_a_fresh_time_budget(self):
+        """静默换版本会让用户以为自己跑的还是原来那个频道 —— 必须说明。"""
+        worker = self._boot_worker_body()
+        self.assertIn(
+            '&format!("上一个频道在上游装不上,正在改用 {alternative}")',
+            worker,
+            "加载页要写明正在换频道",
+        )
+        self.assertIn("fallback_note", worker, "换过之后要一直挂在状态行上")
+        self.assertIn(
+            "deadline = Instant::now()",
+            worker,
+            "换了 tag 等于一份全新下载,要给足时间预算",
+        )
+        self.assertIn("append_launcher_log(&format!(", worker, "回退这件事要写进日志")
+
+    def _boot_worker_body(self):
+        start = self.source.index("spawn_boot_worker(move || {")
+        return self.source[start:self.source.index(".on_menu_event", start)]
+
+    def _spawn_dsh_body(self):
+        return self.source[
+            self.source.index("fn spawn_dsh("):self.source.index("fn plugin_update_log_path(")
+        ]
+
     def test_menu_exposes_all_plugin_update(self):
         self.assertIn('with_id("update-plugins", "一键更新全部插件")', self.source)
         self.assertIn('"version",', self.source)
