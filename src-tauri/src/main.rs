@@ -2110,6 +2110,10 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .build(app).map_err(|e| e.to_string())?;
     let set_shortcut_item = MenuItemBuilder::with_id("set-shortcut", "设置快捷键…")
         .build(app).map_err(|e| e.to_string())?;
+    let backend_log_item = MenuItemBuilder::with_id("backend-log", "查看后端日志…")
+        .build(app).map_err(|e| e.to_string())?;
+    let devtools_item = MenuItemBuilder::with_id("devtools", "开发者工具")
+        .build(app).map_err(|e| e.to_string())?;
     let export_no_cred = MenuItemBuilder::with_id("export-no-cred", "导出配置(不含 API Keys)")
         .build(app).map_err(|e| e.to_string())?;
     let export_with_cred = MenuItemBuilder::with_id("export-cred", "导出配置(含 API Keys)")
@@ -2154,6 +2158,8 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .item(&toggle_item)
         .item(&reload_item)
         .item(&set_shortcut_item)
+        .item(&backend_log_item)
+        .item(&devtools_item)
         .separator()
         .item(&channel_submenu)
         .separator()
@@ -2207,6 +2213,45 @@ fn reload_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.eval("window.location.reload();");
     }
+}
+
+fn open_backend_log_window(app: &tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("backend-log") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+
+    WebviewWindowBuilder::new(
+        app,
+        "backend-log",
+        WebviewUrl::App("backend-log.html".into()),
+    )
+    .title("DSH 后端日志")
+    .inner_size(980.0, 700.0)
+    .min_inner_size(680.0, 420.0)
+    .center()
+    .build()
+    .map(|_| ())
+    .map_err(|error| format!("打开后端日志窗口失败: {error}"))
+}
+
+#[tauri::command]
+fn get_backend_log_cmd() -> serde_json::Value {
+    serde_json::json!({
+        "path": log_path().display().to_string(),
+        "content": tail_launcher_log(1200),
+    })
+}
+
+#[tauri::command]
+fn open_backend_log_cmd(app: tauri::AppHandle) -> Result<(), String> {
+    open_backend_log_window(&app)
+}
+
+#[tauri::command]
+fn restart_app_cmd(app: tauri::AppHandle) {
+    app.restart();
 }
 
 /// 关闭快捷键设置窗口
@@ -2621,7 +2666,13 @@ fn main() {
         .plugin(_single)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![set_shortcut_cmd, close_shortcut_window])
+        .invoke_handler(tauri::generate_handler![
+            set_shortcut_cmd,
+            close_shortcut_window,
+            get_backend_log_cmd,
+            open_backend_log_cmd,
+            restart_app_cmd,
+        ])
         .manage(CurrentShortcut(Mutex::new(shortcut)))
         .manage(DshChild(Mutex::new(None)))
         .plugin(
@@ -3010,6 +3061,19 @@ fn main() {
                     .center()
                     .always_on_top(true)
                     .build();
+                    return;
+                }
+                "backend-log" => {
+                    if let Err(error) = open_backend_log_window(app) {
+                        show_status(app, &error, "error");
+                    }
+                    return;
+                }
+                "devtools" => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        window.open_devtools();
+                        let _ = window.set_focus();
+                    }
                     return;
                 }
                 "quit" => {

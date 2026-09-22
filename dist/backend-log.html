@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>DSH 后端日志</title>
+<style>
+  :root{color-scheme:dark;--bg:#0d1117;--panel:#161b22;--line:#30363d;--text:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--bad:#f85149}
+  *{box-sizing:border-box} html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI",system-ui,sans-serif}
+  body{display:flex;flex-direction:column;padding:16px;gap:12px}
+  header{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  h1{font-size:17px;margin:0 auto 0 0} button{border:1px solid var(--line);background:#21262d;color:var(--text);padding:7px 12px;border-radius:6px;cursor:pointer}
+  button:hover{border-color:var(--accent)} button.danger{color:#ffb4ac;border-color:#6e3030}.meta{font-size:12px;color:var(--dim);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  #path{font-family:ui-monospace,Consolas,monospace;user-select:text}.status{color:var(--dim)}
+  pre{margin:0;flex:1;min-height:0;overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:14px;white-space:pre-wrap;word-break:break-word;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--text)}
+  .error{color:var(--bad)} label{display:flex;align-items:center;gap:6px;cursor:pointer}
+</style>
+</head>
+<body>
+<header>
+  <h1>DSH 后端日志</h1>
+  <label><input id="auto" type="checkbox" checked>自动刷新</label>
+  <button id="refresh">刷新</button>
+  <button id="copy">复制日志</button>
+  <button id="restart" class="danger">重启应用</button>
+</header>
+<div class="meta"><span id="path"></span><span id="status" class="status"></span></div>
+<pre id="log">正在读取日志…</pre>
+<script>
+  const { invoke } = window.__TAURI_INTERNALS__;
+  const log = document.getElementById('log');
+  const path = document.getElementById('path');
+  const status = document.getElementById('status');
+  const auto = document.getElementById('auto');
+  let loading = false;
+
+  async function refresh(forceScroll) {
+    if (loading) return;
+    loading = true;
+    const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+    try {
+      const data = await invoke('get_backend_log_cmd');
+      path.textContent = data.path || '';
+      log.textContent = data.content && data.content.trim() ? data.content : '（暂无后端输出）';
+      status.textContent = '更新于 ' + new Date().toLocaleTimeString();
+      status.className = 'status';
+      if (forceScroll || nearBottom) log.scrollTop = log.scrollHeight;
+    } catch (error) {
+      status.textContent = String(error);
+      status.className = 'status error';
+    } finally {
+      loading = false;
+    }
+  }
+
+  document.getElementById('refresh').onclick = () => refresh(true);
+  document.getElementById('copy').onclick = async () => {
+    try { await navigator.clipboard.writeText(log.textContent); status.textContent = '日志已复制'; }
+    catch (error) { status.textContent = '复制失败：' + error; }
+  };
+  document.getElementById('restart').onclick = () => {
+    if (confirm('确定要完全重启 DeepSeek Harness 吗？')) invoke('restart_app_cmd');
+  };
+  setInterval(() => { if (auto.checked) refresh(false); }, 1500);
+  refresh(true);
+</script>
+</body>
+</html>

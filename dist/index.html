@@ -76,6 +76,9 @@
     .err .reason { margin: 0 0 10px; }
     .err ol { margin: 0; padding-left: 20px; }
     .err li { margin-bottom: 6px; }
+    .err-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+    .err-actions button { border: 1px solid var(--line); border-radius: 6px; background: #21262d; color: var(--text); padding: 7px 12px; cursor: pointer; }
+    .err-actions button:hover { border-color: var(--accent); }
     code { background: #21262d; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
     a { color: var(--accent); }
   </style>
@@ -106,6 +109,10 @@
     <p style="margin:0 0 6px"><strong>建议按顺序排查：</strong></p>
     <ol id="errsteps"></ol>
     <p style="margin:10px 0 0;opacity:.75">错误详情：<code id="errdetail"></code></p>
+    <div class="err-actions">
+      <button id="openlog" type="button">查看后端日志</button>
+      <button id="restart" type="button">重新启动应用</button>
+    </div>
   </div>
 </div>
 
@@ -213,6 +220,14 @@
 
   var timerId = setInterval(tickElapsed, 200);
   tickElapsed();
+
+  var invoke = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke;
+  document.getElementById('openlog').addEventListener('click', function () {
+    if (invoke) invoke('open_backend_log_cmd');
+  });
+  document.getElementById('restart').addEventListener('click', function () {
+    if (invoke) invoke('restart_app_cmd');
+  });
 
   window.__dshBoot = {
     // 更新当前阶段。payload: { stage, percent, detail, title, log, hints }
