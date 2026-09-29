@@ -2108,6 +2108,12 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
     let reload_item = MenuItemBuilder::with_id("reload", "重新加载页面")
         .accelerator("CmdOrCtrl+R")
         .build(app).map_err(|e| e.to_string())?;
+    // 后端卡死且迟迟不恢复时的最后手段。点击时必须先停掉自己拉起的后端再重启：
+    // 否则新实例起来时 3080 还被那个僵死的进程占着，启动流程会把它当成「已有实例」
+    // 直接复用 —— 于是重启完还是坏的。
+    let restart_app_item = MenuItemBuilder::with_id("restart-app", "重启应用")
+        .accelerator("CmdOrCtrl+Shift+R")
+        .build(app).map_err(|e| e.to_string())?;
     let set_shortcut_item = MenuItemBuilder::with_id("set-shortcut", "设置快捷键…")
         .build(app).map_err(|e| e.to_string())?;
     let backend_log_item = MenuItemBuilder::with_id("backend-log", "查看后端日志…")
@@ -2157,6 +2163,7 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
     let config_submenu = SubmenuBuilder::new(app, "配置")
         .item(&toggle_item)
         .item(&reload_item)
+        .item(&restart_app_item)
         .item(&set_shortcut_item)
         .item(&backend_log_item)
         .item(&devtools_item)
@@ -2634,6 +2641,191 @@ fn watchdog_script() -> String {
         .to_string()
 }
 
+// ── 后端健康看门狗（见 spawn_backend_watchdog） ──────────────────────────────
+
+/// 探测后端健康的间隔。
+const BACKEND_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+/// 静默多久之后才提醒用户。低于它什么都不说 —— 重建连接、后端重启都会短暂不回包。
+const BACKEND_SILENCE_WARN: Duration = Duration::from_secs(90);
+/// 同一次静默期里两次提醒的最小间隔，避免刷屏盖掉用户正在读的内容。
+const BACKEND_SILENCE_RENOTIFY: Duration = Duration::from_secs(300);
+/// 重新加载页面之后给前端重建连接的宽限期。
+const BACKEND_RELOAD_GRACE: Duration = Duration::from_secs(90);
+
+/// 「端口在听但不回包」时给用户的说法。
+const BACKEND_WEDGED_HINT: &str = "后端已停止响应：3080 端口还在监听，但不再回复任何请求。\n\
+    这类卡死实测会在几分钟后自己恢复，恢复后本窗口会自动重新加载，无需操作。\n\
+    若长时间不恢复，请用菜单「配置 → 重启应用」。";
+
+/// 「端口上没人」时给用户的说法。
+const BACKEND_GONE_HINT: &str = "后端进程已不在：3080 端口上没有任何服务在监听。\n\
+    请用菜单「配置 → 重启应用」重新拉起后端。";
+
+/// 端口上有没有人在 accept。
+///
+/// 这是 HTTP 探针之外的独立通道，用来把两种「不回包」分开 —— 进程还在（端口在听）
+/// 与进程没了（端口没人），对用户的说法和处置都不同。
+fn has_tcp_listener(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    let Ok(addr) = format!("127.0.0.1:{port}").parse::<SocketAddr>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
+/// 后端此刻的健康形态。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BackendHealth {
+    /// HTTP 层正常应答。401（要先换 launch token）也算 —— 那说明服务是活的。
+    Responding,
+    /// 端口在听，但一个字节都不回。
+    Wedged,
+    /// 端口上没人。
+    Gone,
+}
+
+/// 先问 HTTP，再问端口。
+///
+/// 只靠 HTTP 探针分不出「进程死了」和「进程活着但不干活」：两者都是连不上/超时。
+/// 而这两种情况对用户的说法完全不同，所以要补一次 TCP 连接探测。
+fn probe_backend_health() -> BackendHealth {
+    match probe_dsh() {
+        DshState::Ready | DshState::NeedsAuth => BackendHealth::Responding,
+        DshState::Down => {
+            if has_tcp_listener(DSH_PORT) {
+                BackendHealth::Wedged
+            } else {
+                BackendHealth::Gone
+            }
+        }
+    }
+}
+
+/// 看门狗对一次探测结果的处置。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WatchdogAction {
+    /// 无事发生。
+    Idle,
+    /// 后端刚从静默里恢复：重新加载页面，把前端从挂起的请求里拉出来。
+    Reload,
+    /// 静默太久，提醒用户。
+    Warn,
+}
+
+/// 看门狗的判定状态。与网络和线程解耦，便于单测。
+struct WatchdogState {
+    /// 见过一次正常应答之后才武装。
+    ///
+    /// 首次启动要下依赖包（可能好几分钟），那段时间后端本来就还没监听。不武装，
+    /// 就不会把「正在启动」误报成「后端挂了」，也不会去 reload 一个还在启动的页面。
+    armed: bool,
+    /// 最后一次确认后端还在应答的时刻。静默期从这里起算，而不是从「第一次发现
+    /// 没回应」起算 —— 后者会平白少算一个探测周期，和「后端已经静默多久」的语义
+    /// 也对不上。
+    last_healthy: Instant,
+    /// 本次静默期的起点。
+    down_since: Option<Instant>,
+    /// 这个时刻之前不做判定（刚武装完 / 刚 reload 过）。
+    grace_until: Instant,
+    /// 上一次提醒的时刻。
+    last_warn: Option<Instant>,
+}
+
+impl WatchdogState {
+    fn new(now: Instant) -> Self {
+        Self {
+            armed: false,
+            last_healthy: now,
+            down_since: None,
+            grace_until: now,
+            last_warn: None,
+        }
+    }
+
+    /// 吃一次探测结果，返回该做的动作。
+    fn observe(&mut self, health: BackendHealth, now: Instant) -> WatchdogAction {
+        if health == BackendHealth::Responding {
+            self.armed = true;
+            self.last_healthy = now;
+            self.last_warn = None;
+            // 只有「武装之后静默过、现在又回来了」才算一次自愈。否则每次正常探测都会
+            // 返回 Reload —— 那就成了周期性打断用户。
+            return match self.down_since.take() {
+                Some(_) => {
+                    self.grace_until = now + BACKEND_RELOAD_GRACE;
+                    WatchdogAction::Reload
+                }
+                None => WatchdogAction::Idle,
+            };
+        }
+
+        if !self.armed || now < self.grace_until {
+            return WatchdogAction::Idle;
+        }
+
+        let since = *self.down_since.get_or_insert(self.last_healthy);
+        if now.duration_since(since) < BACKEND_SILENCE_WARN {
+            return WatchdogAction::Idle;
+        }
+        if self
+            .last_warn
+            .is_some_and(|at| now.duration_since(at) < BACKEND_SILENCE_RENOTIFY)
+        {
+            return WatchdogAction::Idle;
+        }
+        self.last_warn = Some(now);
+        WatchdogAction::Warn
+    }
+}
+
+/// 后端健康看门狗：让「后端还在听、但已经不回包」这种卡死变成可自愈的。
+///
+/// 为什么必须由壳来做：dsh 前端的所有 unary RPC 都是**没有超时**的普通 fetch，
+/// 后端不响应时请求就永远挂着 —— 界面既没有错误、也没有断线提示，点什么都像坏了；
+/// 而「重新加载页面」在后端还没恢复时同样无效（新请求照样挂）。更关键的是，前端
+/// 拿不到「后端刚刚恢复」这个信号（它自己的请求还僵在那里），只有壳能站在 HTTP
+/// 之外观察这件事。
+///
+/// 实测现场（2026-09-29）：306/3080 端口在听、进程在跑、前端连接都还 ESTABLISHED，
+/// 但连不带 token 的 `GET /` 都是 0 字节超时；`sample` 显示主线程 100% 卡在
+/// `fs::AfterStat → MicrotaskQueue::PerformCheckpoint` 的微任务自旋里，几分钟后自愈。
+///
+/// 两档处置都刻意**不替用户杀后端**：
+///   1. 恢复即自动重新加载页面 —— 覆盖实测中最常见的情形（静默几分钟后自愈）；
+///   2. 迟迟不恢复才提醒，并指向菜单里的「重启应用」。
+/// 不自动重启应用的理由：卡死期间会话可能仍在后台落盘（实测 jsonl 还在涨），
+/// 自动重启会连带中断它；而这类静默是自限时的，等它比杀它划算。
+fn spawn_backend_watchdog(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let mut state = WatchdogState::new(Instant::now());
+        loop {
+            std::thread::sleep(BACKEND_PROBE_INTERVAL);
+            let health = probe_backend_health();
+            match state.observe(health, Instant::now()) {
+                WatchdogAction::Idle => {}
+                WatchdogAction::Reload => {
+                    append_launcher_log("看门狗:后端已恢复响应,重新加载页面");
+                    show_status(&app, "后端已恢复响应，正在重新加载页面…", "success");
+                    reload_main_window(&app);
+                }
+                WatchdogAction::Warn => {
+                    let (message, detail) = match health {
+                        BackendHealth::Wedged => (BACKEND_WEDGED_HINT, "在监听但不回包"),
+                        BackendHealth::Gone => (BACKEND_GONE_HINT, "已不在监听"),
+                        // Responding 到不了这里(observe 在那种情况下已经返回 Reload/Idle)
+                        BackendHealth::Responding => continue,
+                    };
+                    append_launcher_log(&format!(
+                        "看门狗:后端{detail}已超过 {} 秒未响应",
+                        BACKEND_SILENCE_WARN.as_secs()
+                    ));
+                    show_status(&app, message, "error");
+                }
+            }
+        }
+    });
+}
+
 /// The boot loop uses blocking HTTP and thread sleeps, so it must not run as an
 /// async task. Without an await, reqwest's oneshot polls eventually exhaust the
 /// task's cooperative budget and park forever, bypassing even the boot deadline.
@@ -2749,6 +2941,10 @@ fn main() {
                 None
             };
             let had_child = child.is_some();
+
+            // 后端卡死（端口在听但不回包）时的自愈 —— 见 spawn_backend_watchdog。
+            // 独立线程，不跟启动 worker 抢；它只在见过一次正常应答之后才开始判定。
+            spawn_backend_watchdog(app.handle().clone());
 
             let Some(state) = app.try_state::<DshChild>() else {
                 if let Some(mut child) = child {
@@ -3081,6 +3277,13 @@ fn main() {
                     app.exit(0);
                     return;
                 }
+                "restart-app" => {
+                    // 先收掉后端：僵死的进程占着 3080，新实例会直接复用它（而它已经坏了）。
+                    stop_owned_dsh(app);
+                    append_launcher_log("用户从菜单重启应用");
+                    app.restart();
+                    return;
+                }
                 _ => {}
             }
 
@@ -3151,6 +3354,136 @@ mod tests {
         ] {
             assert!(!is_dsh_web_url(other), "不该注入看门狗: {other}");
         }
+    }
+
+    #[test]
+    fn backend_watchdog_ignores_a_cold_start() {
+        // 首次启动要下依赖包（可能好几分钟），那期间端口毫无响应。没见过一次正常应答
+        // 之前不武装 —— 否则每次启动都会立刻误报「后端挂了」。
+        let now = Instant::now();
+        let mut state = WatchdogState::new(now);
+        assert_eq!(
+            state.observe(BackendHealth::Gone, now + Duration::from_secs(600)),
+            WatchdogAction::Idle
+        );
+        assert_eq!(
+            state.observe(BackendHealth::Wedged, now + Duration::from_secs(900)),
+            WatchdogAction::Idle
+        );
+    }
+
+    #[test]
+    fn backend_watchdog_reloads_exactly_once_when_the_backend_comes_back() {
+        let now = Instant::now();
+        let mut state = WatchdogState::new(now);
+        // 武装的那一次不能 reload：它只是启动完成，不是「恢复」。
+        assert_eq!(
+            state.observe(BackendHealth::Responding, now),
+            WatchdogAction::Idle
+        );
+        let silent = now + BACKEND_SILENCE_WARN + Duration::from_secs(1);
+        assert_eq!(
+            state.observe(BackendHealth::Wedged, silent),
+            WatchdogAction::Warn
+        );
+        let back = silent + Duration::from_secs(10);
+        assert_eq!(
+            state.observe(BackendHealth::Responding, back),
+            WatchdogAction::Reload
+        );
+        assert_eq!(
+            state.observe(BackendHealth::Responding, back + Duration::from_secs(10)),
+            WatchdogAction::Idle,
+            "恢复只能触发一次 reload,否则会变成周期性打断"
+        );
+    }
+
+    #[test]
+    fn backend_watchdog_keeps_quiet_before_the_silence_threshold() {
+        // 阈值之内不许出声：重建连接、后端自己重启都会短暂不回包。
+        let now = Instant::now();
+        let mut state = WatchdogState::new(now);
+        state.observe(BackendHealth::Responding, now);
+        let almost = now + BACKEND_SILENCE_WARN - Duration::from_secs(1);
+        assert_eq!(
+            state.observe(BackendHealth::Wedged, almost),
+            WatchdogAction::Idle
+        );
+    }
+
+    #[test]
+    fn backend_watchdog_does_not_repeat_a_warning_during_one_silence() {
+        let now = Instant::now();
+        let mut state = WatchdogState::new(now);
+        state.observe(BackendHealth::Responding, now);
+        let first = now + BACKEND_SILENCE_WARN + Duration::from_secs(1);
+        assert_eq!(
+            state.observe(BackendHealth::Wedged, first),
+            WatchdogAction::Warn
+        );
+        assert_eq!(
+            state.observe(BackendHealth::Wedged, first + Duration::from_secs(10)),
+            WatchdogAction::Idle
+        );
+        let later = first + BACKEND_SILENCE_RENOTIFY + Duration::from_secs(1);
+        assert_eq!(
+            state.observe(BackendHealth::Wedged, later),
+            WatchdogAction::Warn
+        );
+    }
+
+    #[test]
+    fn backend_watchdog_gives_a_reloaded_page_a_grace_period() {
+        // 刚 reload 出来的文档要重新建立连接，这期间的探测失败不算数 ——
+        // 否则会在恢复的瞬间反复 reload。
+        let now = Instant::now();
+        let mut state = WatchdogState::new(now);
+        state.observe(BackendHealth::Responding, now);
+        let silent = now + BACKEND_SILENCE_WARN + Duration::from_secs(1);
+        state.observe(BackendHealth::Wedged, silent);
+        let back = silent + Duration::from_secs(1);
+        assert_eq!(
+            state.observe(BackendHealth::Responding, back),
+            WatchdogAction::Reload
+        );
+        assert_eq!(
+            state.observe(BackendHealth::Wedged, back + Duration::from_secs(5)),
+            WatchdogAction::Idle
+        );
+        // 宽限期之内怎么失败都不许出声。
+        assert_eq!(
+            state.observe(
+                BackendHealth::Wedged,
+                back + BACKEND_RELOAD_GRACE - Duration::from_secs(1)
+            ),
+            WatchdogAction::Idle
+        );
+        // 宽限期一过就接着算「最后一次健康」到现在：宽限期内的失败**不能**把静默期
+        // 重新起算（否则每次 reload 都会把计时清零，卡死就永远等不到告警）。
+        assert_eq!(
+            state.observe(
+                BackendHealth::Wedged,
+                back + BACKEND_RELOAD_GRACE + Duration::from_secs(1)
+            ),
+            WatchdogAction::Warn
+        );
+    }
+
+    #[test]
+    fn an_unused_port_is_not_reported_as_listening() {
+        // 探针的「没人听」这一侧：连不上必须返回 false，不能把连接失败也算成有人。
+        // 取一个高位端口，避开常见的本地服务。
+        assert!(!has_tcp_listener(59_873));
+    }
+
+    #[test]
+    fn a_bound_port_is_reported_as_listening() {
+        // 探针的另一侧：端口真有人 accept 时必须返回 true —— 「在听但不回包」这个
+        // 判据全靠它，漏了就会把僵死的后端误判成「进程已经退出」。
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        assert!(has_tcp_listener(port));
     }
 
     #[test]
