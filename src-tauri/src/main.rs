@@ -2698,21 +2698,14 @@ fn watchdog_script() -> String {
 
 /// 探测后端健康的间隔。
 const BACKEND_PROBE_INTERVAL: Duration = Duration::from_secs(10);
-/// 静默多久之后才提醒用户。低于它什么都不说 —— 重建连接、后端重启都会短暂不回包。
-const BACKEND_SILENCE_WARN: Duration = Duration::from_secs(90);
-/// 同一次静默期里两次提醒的最小间隔，避免刷屏盖掉用户正在读的内容。
-const BACKEND_SILENCE_RENOTIFY: Duration = Duration::from_secs(300);
+/// 静默多久之后把常驻横幅挂到页面上。低于它什么都不说 —— 重建连接、后端重启都会短暂不回包。
+const BACKEND_SILENCE_ANNOUNCE: Duration = Duration::from_secs(30);
+/// 横幅挂出后多久还没恢复：措辞升级，明确指向手动重启。
+const BACKEND_SILENCE_ESCALATE: Duration = Duration::from_secs(150);
+/// 同一次静默期里两次写启动日志的最小间隔，避免刷屏盖掉有用的记录。
+const BACKEND_SILENCE_RELOG: Duration = Duration::from_secs(300);
 /// 重新加载页面之后给前端重建连接的宽限期。
 const BACKEND_RELOAD_GRACE: Duration = Duration::from_secs(90);
-
-/// 「端口在听但不回包」时给用户的说法。
-const BACKEND_WEDGED_HINT: &str = "后端已停止响应：3080 端口还在监听，但不再回复任何请求。\n\
-    这类卡死实测会在几分钟后自己恢复，恢复后本窗口会自动重新加载，无需操作。\n\
-    若长时间不恢复，请用菜单「配置 → 重启应用」。";
-
-/// 「端口上没人」时给用户的说法。
-const BACKEND_GONE_HINT: &str = "后端进程已不在：3080 端口上没有任何服务在监听。\n\
-    请用菜单「配置 → 重启应用」重新拉起后端。";
 
 /// 端口上有没有人在 accept。
 ///
@@ -2754,6 +2747,39 @@ fn probe_backend_health() -> BackendHealth {
     }
 }
 
+/// 页面常驻横幅的文案：区分「端口在听但不回包」与「端口上没人」，
+/// 并带上已静默时长 —— 用户至少知道它卡了多久、什么时候该动手。
+fn backend_wedge_banner_message(
+    health: BackendHealth,
+    silent_for: Duration,
+    escalate: bool,
+) -> String {
+    let secs = silent_for.as_secs();
+    match health {
+        BackendHealth::Wedged => {
+            let mut message = format!(
+                "后端无响应：3080 端口仍在监听，但已 {secs} 秒不回包。\n\
+                 这类卡死实测会在几分钟后自己恢复，恢复后本窗口自动重新加载，无需操作。"
+            );
+            if escalate {
+                message.push_str(&format!(
+                    "\n已超过 {} 秒没有起色，建议用菜单「配置 → 重启应用」（Cmd+Shift+R）。",
+                    BACKEND_SILENCE_ESCALATE.as_secs()
+                ));
+            }
+            message
+        }
+        BackendHealth::Gone => format!(
+            "后端进程已不在：3080 端口上没有任何服务（已 {secs} 秒）。\n\
+             请用菜单「配置 → 重启应用」（Cmd+Shift+R）重新拉起后端。"
+        ),
+        // 探测结果只会以静默形态进入这里;真拿到 Responding 说明状态在并发变化,给个兜底文案。
+        BackendHealth::Responding => {
+            format!("后端已恢复响应（静默 {secs} 秒），正在重新加载页面…")
+        }
+    }
+}
+
 /// 看门狗对一次探测结果的处置。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WatchdogAction {
@@ -2761,8 +2787,15 @@ enum WatchdogAction {
     Idle,
     /// 后端刚从静默里恢复：重新加载页面，把前端从挂起的请求里拉出来。
     Reload,
-    /// 静默太久，提醒用户。
-    Warn,
+    /// 后端正在静默：把页面上那条常驻横幅刷成最新文案（已卡时长在走）。
+    Banner {
+        /// 从最后一次确认健康起算，已经静默多久。
+        silent_for: Duration,
+        /// 已经久到该升级措辞、明确指引手动重启。
+        escalate: bool,
+        /// 这次是否要往启动日志里记一行（首条 + 每 5 分钟 + 升级那一刻）。
+        log: bool,
+    },
 }
 
 /// 看门狗的判定状态。与网络和线程解耦，便于单测。
@@ -2780,8 +2813,10 @@ struct WatchdogState {
     down_since: Option<Instant>,
     /// 这个时刻之前不做判定（刚武装完 / 刚 reload 过）。
     grace_until: Instant,
-    /// 上一次提醒的时刻。
-    last_warn: Option<Instant>,
+    /// 上一次写「静默」日志的时刻。
+    last_log: Option<Instant>,
+    /// 本次静默期是否已经升级过措辞（升级那一刻单独记一条日志）。
+    escalated: bool,
 }
 
 impl WatchdogState {
@@ -2791,7 +2826,8 @@ impl WatchdogState {
             last_healthy: now,
             down_since: None,
             grace_until: now,
-            last_warn: None,
+            last_log: None,
+            escalated: false,
         }
     }
 
@@ -2800,7 +2836,8 @@ impl WatchdogState {
         if health == BackendHealth::Responding {
             self.armed = true;
             self.last_healthy = now;
-            self.last_warn = None;
+            self.last_log = None;
+            self.escalated = false;
             // 只有「武装之后静默过、现在又回来了」才算一次自愈。否则每次正常探测都会
             // 返回 Reload —— 那就成了周期性打断用户。
             return match self.down_since.take() {
@@ -2817,17 +2854,75 @@ impl WatchdogState {
         }
 
         let since = *self.down_since.get_or_insert(self.last_healthy);
-        if now.duration_since(since) < BACKEND_SILENCE_WARN {
+        let silent_for = now.duration_since(since);
+        if silent_for < BACKEND_SILENCE_ANNOUNCE {
             return WatchdogAction::Idle;
         }
-        if self
-            .last_warn
-            .is_some_and(|at| now.duration_since(at) < BACKEND_SILENCE_RENOTIFY)
-        {
-            return WatchdogAction::Idle;
+        // 横幅本身每次探测都要重刷（时长在走），但日志不能跟着刷屏：
+        // 首条、每 5 分钟一条、措辞升级那一刻一条。
+        let escalate = silent_for >= BACKEND_SILENCE_ESCALATE;
+        let relog_due = self
+            .last_log
+            .map_or(true, |at| now.duration_since(at) >= BACKEND_SILENCE_RELOG);
+        let escalation_transition = escalate && !self.escalated;
+        self.escalated = escalate;
+        let log = relog_due || escalation_transition;
+        if log {
+            self.last_log = Some(now);
         }
-        self.last_warn = Some(now);
-        WatchdogAction::Warn
+        WatchdogAction::Banner {
+            silent_for,
+            escalate,
+            log,
+        }
+    }
+}
+
+/// 把「后端卡住」的常驻横幅挂到页面上 —— 每次探测都会重刷文案（已卡时长在走）。
+///
+/// 与 `show_status` 的 toast 不同，它**不会自动消失**：卡死可能持续几分钟，
+/// 一条 8 秒就隐的提示等于没说。恢复后页面会被重新加载，横幅随文档一起消失；
+/// 用户嫌挡也可以点 × 收掉（这一份文档里不再出现）。
+fn show_backend_banner(app: &tauri::AppHandle, message: &str) {
+    if let Some(window) = app.get_webview_window("main") {
+        let message_json = serde_json::to_string(message).unwrap();
+        let script = format!(
+            r#"(() => {{
+                const id = 'dsh-app-backend-banner';
+                const message = {message};
+                if (window.__dshBackendBannerClosed) return;
+
+                let node = document.getElementById(id);
+                if (!node) {{
+                    node = document.createElement('div');
+                    node.id = id;
+                    node.setAttribute('role', 'alert');
+                    node.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;max-width:640px;padding:12px 36px 12px 16px;border-radius:8px;font:14px/1.45 system-ui,sans-serif;white-space:pre-wrap;box-shadow:0 4px 18px rgba(0,0,0,.28);background:#8b3030;color:#fff;text-align:left';
+                    document.body.appendChild(node);
+
+                    const close = document.createElement('button');
+                    close.className = 'dsh-app-backend-banner-close';
+                    close.type = 'button';
+                    close.setAttribute('aria-label', '关闭提示');
+                    close.textContent = '×';
+                    close.style.cssText = 'position:absolute;top:6px;right:8px;width:20px;height:20px;padding:0;border:0;border-radius:4px;background:transparent;color:#fff;font:16px/1 system-ui,sans-serif;cursor:pointer;opacity:.75';
+                    close.addEventListener('mouseenter', () => {{ close.style.opacity = '1'; }});
+                    close.addEventListener('mouseleave', () => {{ close.style.opacity = '.75'; }});
+                    close.addEventListener('click', () => {{
+                        window.__dshBackendBannerClosed = true;
+                        node.remove();
+                    }});
+                    node.appendChild(close);
+
+                    const body = document.createElement('span');
+                    body.className = 'dsh-app-backend-banner-body';
+                    node.insertBefore(body, node.firstChild);
+                }}
+                node.querySelector('.dsh-app-backend-banner-body').textContent = message;
+            }})();"#,
+            message = message_json,
+        );
+        let _ = window.eval(&script);
     }
 }
 
@@ -2843,9 +2938,10 @@ impl WatchdogState {
 /// 但连不带 token 的 `GET /` 都是 0 字节超时；`sample` 显示主线程 100% 卡在
 /// `fs::AfterStat → MicrotaskQueue::PerformCheckpoint` 的微任务自旋里，几分钟后自愈。
 ///
-/// 两档处置都刻意**不替用户杀后端**：
+/// 处置刻意**不替用户杀后端**：
 ///   1. 恢复即自动重新加载页面 —— 覆盖实测中最常见的情形（静默几分钟后自愈）；
-///   2. 迟迟不恢复才提醒，并指向菜单里的「重启应用」。
+///   2. 静默期间在页面顶部挂一条**常驻**横幅：实时带着「已卡了多久」的时长，
+///      久不恢复（150s）就升级措辞、指向菜单里的「重启应用」。
 /// 不自动重启应用的理由：卡死期间会话可能仍在后台落盘（实测 jsonl 还在涨），
 /// 自动重启会连带中断它；而这类静默是自限时的，等它比杀它划算。
 fn spawn_backend_watchdog(app: tauri::AppHandle) {
@@ -2857,22 +2953,32 @@ fn spawn_backend_watchdog(app: tauri::AppHandle) {
             match state.observe(health, Instant::now()) {
                 WatchdogAction::Idle => {}
                 WatchdogAction::Reload => {
-                    append_launcher_log("看门狗:后端已恢复响应,重新加载页面");
+                    append_launcher_log("看门狗:后端已恢复响应,重新加载页面\n");
                     show_status(&app, "后端已恢复响应，正在重新加载页面…", "success");
                     reload_main_window(&app);
                 }
-                WatchdogAction::Warn => {
-                    let (message, detail) = match health {
-                        BackendHealth::Wedged => (BACKEND_WEDGED_HINT, "在监听但不回包"),
-                        BackendHealth::Gone => (BACKEND_GONE_HINT, "已不在监听"),
+                WatchdogAction::Banner {
+                    silent_for,
+                    escalate,
+                    log,
+                } => {
+                    let detail = match health {
+                        BackendHealth::Wedged => "在监听但不回包",
+                        BackendHealth::Gone => "已不在监听",
                         // Responding 到不了这里(observe 在那种情况下已经返回 Reload/Idle)
                         BackendHealth::Responding => continue,
                     };
-                    append_launcher_log(&format!(
-                        "看门狗:后端{detail}已超过 {} 秒未响应",
-                        BACKEND_SILENCE_WARN.as_secs()
-                    ));
-                    show_status(&app, message, "error");
+                    if log {
+                        let escalation_note = if escalate { "，措辞已升级" } else { "" };
+                        append_launcher_log(&format!(
+                            "看门狗:后端{detail}已 {} 秒未响应{escalation_note}\n",
+                            silent_for.as_secs()
+                        ));
+                    }
+                    show_backend_banner(
+                        &app,
+                        &backend_wedge_banner_message(health, silent_for, escalate),
+                    );
                 }
             }
         }
@@ -3384,7 +3490,7 @@ fn main() {
                 "restart-app" => {
                     // 先收掉后端：僵死的进程占着 3080，新实例会直接复用它（而它已经坏了）。
                     stop_owned_dsh(app);
-                    append_launcher_log("用户从菜单重启应用");
+                    append_launcher_log("用户从菜单重启应用\n");
                     app.restart();
                     return;
                 }
@@ -3485,10 +3591,14 @@ mod tests {
             state.observe(BackendHealth::Responding, now),
             WatchdogAction::Idle
         );
-        let silent = now + BACKEND_SILENCE_WARN + Duration::from_secs(1);
+        let silent = now + BACKEND_SILENCE_ANNOUNCE + Duration::from_secs(1);
         assert_eq!(
             state.observe(BackendHealth::Wedged, silent),
-            WatchdogAction::Warn
+            WatchdogAction::Banner {
+                silent_for: BACKEND_SILENCE_ANNOUNCE + Duration::from_secs(1),
+                escalate: false,
+                log: true,
+            }
         );
         let back = silent + Duration::from_secs(10);
         assert_eq!(
@@ -3508,7 +3618,7 @@ mod tests {
         let now = Instant::now();
         let mut state = WatchdogState::new(now);
         state.observe(BackendHealth::Responding, now);
-        let almost = now + BACKEND_SILENCE_WARN - Duration::from_secs(1);
+        let almost = now + BACKEND_SILENCE_ANNOUNCE - Duration::from_secs(1);
         assert_eq!(
             state.observe(BackendHealth::Wedged, almost),
             WatchdogAction::Idle
@@ -3516,24 +3626,33 @@ mod tests {
     }
 
     #[test]
-    fn backend_watchdog_does_not_repeat_a_warning_during_one_silence() {
+    fn backend_watchdog_banner_logs_at_a_slow_cadence_and_on_escalation() {
+        // 横幅每次探测都要刷（已卡时长在走），但日志不能跟着刷屏：
+        // 首条、措辞升级那一刻、以及之后每 5 分钟一条。
         let now = Instant::now();
         let mut state = WatchdogState::new(now);
         state.observe(BackendHealth::Responding, now);
-        let first = now + BACKEND_SILENCE_WARN + Duration::from_secs(1);
-        assert_eq!(
-            state.observe(BackendHealth::Wedged, first),
-            WatchdogAction::Warn
-        );
-        assert_eq!(
-            state.observe(BackendHealth::Wedged, first + Duration::from_secs(10)),
-            WatchdogAction::Idle
-        );
-        let later = first + BACKEND_SILENCE_RENOTIFY + Duration::from_secs(1);
-        assert_eq!(
-            state.observe(BackendHealth::Wedged, later),
-            WatchdogAction::Warn
-        );
+        let cases = [
+            // (静默秒数, 是否升级, 是否记日志)
+            (31, false, true),
+            (41, false, false),
+            (151, true, true),
+            (161, true, false),
+            // 451 恰好距上次记日志(151s)满 300s —— 到点就记;452 刚记过,不重复。
+            (451, true, true),
+            (452, true, false),
+        ];
+        for (secs, escalate, log) in cases {
+            assert_eq!(
+                state.observe(BackendHealth::Wedged, now + Duration::from_secs(secs)),
+                WatchdogAction::Banner {
+                    silent_for: Duration::from_secs(secs),
+                    escalate,
+                    log,
+                },
+                "静默 {secs}s 时的处置"
+            );
+        }
     }
 
     #[test]
@@ -3543,7 +3662,7 @@ mod tests {
         let now = Instant::now();
         let mut state = WatchdogState::new(now);
         state.observe(BackendHealth::Responding, now);
-        let silent = now + BACKEND_SILENCE_WARN + Duration::from_secs(1);
+        let silent = now + BACKEND_SILENCE_ANNOUNCE + Duration::from_secs(1);
         state.observe(BackendHealth::Wedged, silent);
         let back = silent + Duration::from_secs(1);
         assert_eq!(
@@ -3569,8 +3688,66 @@ mod tests {
                 BackendHealth::Wedged,
                 back + BACKEND_RELOAD_GRACE + Duration::from_secs(1)
             ),
-            WatchdogAction::Warn
+            WatchdogAction::Banner {
+                silent_for: BACKEND_RELOAD_GRACE + Duration::from_secs(1),
+                escalate: false,
+                log: true,
+            }
         );
+    }
+
+    /// `show_backend_banner` 注入的脚本源文本。
+    fn banner_script_source() -> &'static str {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn show_backend_banner(")
+            .expect("show_backend_banner must exist");
+        let end = source[start..]
+            .find("/// 后端健康看门狗：")
+            .expect("show_backend_banner must be followed by the watchdog docs")
+            + start;
+        let body = &source[start..end];
+        let open = body.find("r#\"").expect("banner script raw string") + 3;
+        let close = body[open..].find("\"#").expect("banner script terminator") + open;
+        &body[open..close]
+    }
+
+    /// 卡死可能持续几分钟:横幅必须常驻,不能像 toast 一样一会儿就隐。
+    #[test]
+    fn backend_banner_is_persistent_not_a_toast() {
+        let script = banner_script_source();
+        assert!(script.contains("dsh-app-backend-banner"), "缺少横幅节点 id");
+        assert!(!script.contains("AUTO_HIDE"), "常驻横幅不该有自动消失机制");
+    }
+
+    /// 横幅必须能被关掉,且关掉之后同一份文档里不再刷出来。
+    #[test]
+    fn backend_banner_respects_an_explicit_dismiss() {
+        let script = banner_script_source();
+        assert!(script.contains("__dshBackendBannerClosed"), "缺少关闭标记");
+        assert!(script.contains("node.remove()"), "关闭后要把节点从 DOM 移除");
+    }
+
+    /// 文案要把「卡了多久、接下来怎么办」说全。
+    #[test]
+    fn backend_banner_message_carries_elapsed_seconds_and_directions() {
+        let early =
+            backend_wedge_banner_message(BackendHealth::Wedged, Duration::from_secs(31), false);
+        assert!(early.contains("31"), "要带上已卡时长,实际: {early}");
+        assert!(
+            !early.contains("重启应用"),
+            "还没到升级点,先别吓人: {early}"
+        );
+
+        let late =
+            backend_wedge_banner_message(BackendHealth::Wedged, Duration::from_secs(151), true);
+        assert!(late.contains("151"), "升级文案也要带上时长: {late}");
+        assert!(late.contains("重启应用"), "升级后必须给出手动重启指引");
+
+        let gone =
+            backend_wedge_banner_message(BackendHealth::Gone, Duration::from_secs(31), false);
+        assert!(gone.contains("没有任何服务"), "端口上没人要换个说法: {gone}");
+        assert!(gone.contains("重启应用"), "进程没了只能手动重启");
     }
 
     #[test]

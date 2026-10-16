@@ -659,6 +659,24 @@ class LauncherCommandTests(unittest.TestCase):
         script = self._function_body("fn watchdog_script()")
         self.assertIn("window.__dshWatchdogInstalled", script)
 
+    def test_stuck_backend_gets_a_persistent_banner_not_a_toast(self):
+        """卡死可能持续几分钟:提示不能像 toast 一样几秒就隐,否则等于没说。"""
+        script = self._function_body("fn show_backend_banner(")
+        self.assertIn("dsh-app-backend-banner", script)
+        self.assertNotIn("AUTO_HIDE", script)
+
+    def test_the_backend_banner_respects_an_explicit_dismiss(self):
+        """用户点 × 收掉之后,同一份文档里不能再刷出来 —— 不然它关不掉。"""
+        script = self._function_body("fn show_backend_banner(")
+        self.assertIn("__dshBackendBannerClosed", script)
+        self.assertIn("node.remove()", script)
+
+    def test_watchdog_paints_the_banner_while_the_backend_is_silent(self):
+        """静默期靠页面横幅把「卡了多久」说清楚,而不是一条会消失的 toast。"""
+        self.assertIn("WatchdogAction::Banner", self.source)
+        self.assertIn("backend_wedge_banner_message(", self.source)
+        self.assertIn("show_backend_banner(", self.source)
+
 
 class ShellLaunchScriptTests(unittest.TestCase):
     """真跑一遍从 main.rs 抽出的 shell 脚本,验证选路行为而不只是源码文本。
