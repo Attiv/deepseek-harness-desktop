@@ -111,6 +111,8 @@ class LauncherCommandTests(unittest.TestCase):
         """
         self.assertIn("where pnpm >nul 2>nul & if errorlevel 1", self.source)
         self.assertNotIn("pnpm dlx {spec} web --no-open || npx", self.source)
+        # pnpm ≥ 12 的 IGNORED_BUILDS 重试也要落在 Windows 分支上,且参数在包名之前
+        self.assertIn("(pnpm dlx {pnpm_flag}{spec} web --no-open)", self.source)
 
     def test_windows_command_line_bypasses_rust_argument_escaping(self):
         """cmd 的 `&`/`(` 是语法,被 Rust 转义成字面量就失效了,必须走 raw_arg。"""
@@ -254,7 +256,7 @@ class LauncherCommandTests(unittest.TestCase):
             "备选要逐个取用,而不是只取一次",
         )
         self.assertEqual(
-            worker.count("spawn_dsh(&alternative)"),
+            worker.count("spawn_dsh(&alternative, skip_build_scripts)"),
             1,
             "换频道只该有一个落点,否则改一处漏一处",
         )
@@ -353,7 +355,7 @@ class LauncherCommandTests(unittest.TestCase):
         """重试必须把新进程写回共享状态 —— 否则 try_wait 还盯着已经退出的旧进程,
         而旧进程永远不会再就绪,回退就成了白等一场。"""
         worker = self._boot_worker_body()
-        segment = worker[worker.index("spawn_dsh(&alternative)"):]
+        segment = worker[worker.index("spawn_dsh(&alternative, skip_build_scripts)"):]
         # 整个回退分支(含「拿不到共享状态」那个兜底臂)
         segment = segment[:segment.index("// 日志里没写明原因")]
         self.assertIn("try_state::<DshChild>()", segment)
@@ -444,7 +446,7 @@ class LauncherCommandTests(unittest.TestCase):
         main = self.source[
             self.source.index("fn main() {"):self.source.index("#[cfg(test)]")
         ]
-        spawn = main.index("spawn_dsh(&spec)")
+        spawn = main.index("spawn_dsh(&spec, false)")
         resolve = main.index("let spec = resolve_dsh_spec();")
         self.assertRegex(
             main[:resolve],
@@ -553,7 +555,9 @@ class LauncherCommandTests(unittest.TestCase):
         setup = main.index(".setup(move |app| {")
         menu_events = main.index(".on_menu_event", setup)
 
-        spawn_calls = list(re.finditer(r"\bspawn_dsh\s*\(\s*&spec\s*\)", main))
+        spawn_calls = list(
+            re.finditer(r"\bspawn_dsh\s*\(\s*&spec\s*,\s*false\s*\)", main)
+        )
         self.assertEqual(len(spawn_calls), 1, "main should have one deferred backend spawn")
         spawn = spawn_calls[0].start()
 
@@ -677,16 +681,19 @@ class ShellLaunchScriptTests(unittest.TestCase):
             else '#[cfg(not(any(target_os = "windows", target_os = "macos")))]'
         )
         branch = source[source.index(marker):]
-        cls.script = re.search(r'r#"(.*?)"#', branch, re.DOTALL).group(1).replace(
+        # 源码文本里 {spec} / {pnpm_flag} 是 format! 的注入口,这里手动替换掉:
+        # 默认路径 = 不带跳过脚本参数;重试路径由专门测试替换成带参数版本。
+        cls.script_template = re.search(r'r#"(.*?)"#', branch, re.DOTALL).group(1).replace(
             "{spec}", cls.SPEC
         )
+        cls.script = cls.script_template.replace("{pnpm_flag}", "")
         cls.shell = (
             "/bin/zsh"
             if sys.platform == "darwin" and Path("/bin/zsh").exists()
             else "/bin/sh"
         )
 
-    def run_script(self, *available):
+    def run_script(self, *available, script=None):
         """在只有 `available` 这些命令的 PATH 下跑脚本,返回合并输出。"""
         with tempfile.TemporaryDirectory() as tmp:
             binaries, home = Path(tmp) / "bin", Path(tmp) / "home"
@@ -697,7 +704,7 @@ class ShellLaunchScriptTests(unittest.TestCase):
                 stub.write_text(self.STUB % name.upper())
                 stub.chmod(0o755)
             done = subprocess.run(
-                [self.shell, "-c", self.script],
+                [self.shell, "-c", self.script if script is None else script],
                 capture_output=True,
                 text=True,
                 # HOME 指向空目录:让脚本兜底探测的那些 pnpm 安装路径全部落空
@@ -712,13 +719,60 @@ class ShellLaunchScriptTests(unittest.TestCase):
 
         所以脚本里出现 `{{` 就是信号:那是 format! 的转义,抽出来 zsh 会报
         `bad substitution`。要在脚本里写默认值就用 if 判断,别用 ${VAR:-默认}。
+        注入口只有 {spec} 与 {pnpm_flag}(setUpClass 已替换成空/默认值)。
         """
-        self.assertNotIn("{", self.script, "除了 {spec} 不该有别的花括号")
+        self.assertNotIn("{", self.script, "除了 {spec} / {pnpm_flag} 不该有别的花括号")
 
     def test_pnpm_is_preferred_when_present(self):
         output, code = self.run_script("pnpm", "npx")
         self.assertEqual(output, f"STUB-PNPM dlx {self.SPEC} web --no-open")
         self.assertEqual(code, 0)
+
+    def test_the_build_skip_retry_puts_the_flag_before_the_package_spec(self):
+        """pnpm ≥ 12 的 ERR_PNPM_IGNORED_BUILDS 重试会带 --config.ignore-scripts=true。
+
+        参数必须落在包名之前 —— 放到 `web --no-open` 后面会被当成 dsh 自己的参数,
+        安装照样失败;而裸的 --ignore-scripts 在 pnpm 10/11 的 dlx 上是 Unknown option,
+        所以壳里固定用 --config. 通用写法。
+        """
+        flagged = self.script_template.replace(
+            "{pnpm_flag}", "--config.ignore-scripts=true "
+        )
+        output, code = self.run_script("pnpm", "npx", script=flagged)
+        self.assertEqual(
+            output,
+            f"STUB-PNPM dlx --config.ignore-scripts=true {self.SPEC} web --no-open",
+            "参数必须在 dlx 之后、包名之前",
+        )
+        self.assertEqual(code, 0)
+
+    def test_the_build_skip_retry_flag_survives_the_home_fallback_path(self):
+        """pnpm 不在 PATH、从 ~/.npm-global/bin 兜底找到时也要带参数 ——
+        两个调用点漏一个,那条路径上的用户就还是起不来。"""
+        flagged = self.script_template.replace(
+            "{pnpm_flag}", "--config.ignore-scripts=true "
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / ".npm-global" / "bin").mkdir(parents=True)
+            stub = home / ".npm-global" / "bin" / "pnpm"
+            stub.write_text(self.STUB % "GLOBAL")
+            stub.chmod(0o755)
+            done = subprocess.run(
+                [self.shell, "-c", flagged],
+                capture_output=True,
+                text=True,
+                env={"PATH": "/usr/bin:/bin", "HOME": str(home)},
+                stdin=subprocess.DEVNULL,
+                timeout=30,
+            )
+            output = (done.stdout + done.stderr).strip()
+        self.assertEqual(
+            output,
+            f"STUB-GLOBAL dlx --config.ignore-scripts=true {self.SPEC} web --no-open",
+            "兜底路径漏了参数,那条路上的用户还是起不来",
+        )
+        self.assertEqual(done.returncode, 0)
 
     def test_falls_back_to_non_interactive_npx_without_pnpm(self):
         """缺 pnpm 时必须回退 npx -y,而不是 exit 127 让窗口白等到超时。"""

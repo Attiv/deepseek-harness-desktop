@@ -396,6 +396,10 @@ enum BootFailure {
     ChannelUnavailable,
     /// 版本装上了,但装配插件树时某个插件抛错,后端直接退出。
     PluginTreeFailed,
+    /// pnpm ≥ 12 把「依赖的构建脚本未获批准」当硬错误(ERR_PNPM_IGNORED_BUILDS),
+    /// dlx 在 dsh 启动前就 exit 1。正常路径会自动跳过脚本重试一次;走到这里
+    /// 说明重试之后仍然失败,或日志里是上一次尝试的残留。
+    BuildScriptsBlocked,
 }
 
 impl BootFailure {
@@ -407,6 +411,7 @@ impl BootFailure {
             BootFailure::NotReady => "DSH 启动超时",
             BootFailure::ChannelUnavailable => "上游这个版本装不上",
             BootFailure::PluginTreeFailed => "插件与当前 dsh 不兼容",
+            BootFailure::BuildScriptsBlocked => "pnpm 拦下了依赖构建脚本",
         }
     }
 
@@ -436,6 +441,13 @@ ERR_PNPM_NO_MATCHING_VERSION —— 这是上游发布缺件,不是你机器的�
                 "dsh 本体已经装上了,但它在装配插件树时抛错并退出 —— 某个已装插件调用的 \
 dsh 内部 API 在当前版本上已经变了。这是插件与版本不匹配,不是网络或 Node 的问题, \
 换频道通常也治不了。"
+                    .to_string()
+            }
+            BootFailure::BuildScriptsBlocked => {
+                "pnpm ≥ 12 把「依赖里有未批准运行的构建脚本」当成了硬错误 \
+(ERR_PNPM_IGNORED_BUILDS):dlx 在 DSH 后端启动前就退出了 —— 旧版 pnpm 遇到同样的 \
+情况只是警告。壳在拉起后端时会自动改用 --config.ignore-scripts=true 重试一次; \
+本页仍然出现时,请对照下面的日志确认是否还是同一个错误。"
                     .to_string()
             }
         }
@@ -477,6 +489,12 @@ dsh 内部 API 在当前版本上已经变了。这是插件与版本不匹配,�
                 r#"权限档名冲突是最常见的一类:dsh 0.1.6 起把 <code>auto</code> 变成了保留名,自建权限档的插件必须改掉自己的 <code>presetName</code>"#.to_string(),
                 r#"想看完整名单就手动跑 <code>pnpm dlx @deepseek-ai/dsh@latest web --no-open</code>,它会一次列出所有装载失败的插件"#.to_string(),
             ],
+            BootFailure::BuildScriptsBlocked => vec![
+                r#"在终端手动执行 <code>pnpm dlx --config.ignore-scripts=true @deepseek-ai/dsh@latest web --no-open</code>,确认是否还报同一个错"#.to_string(),
+                r#"这是 pnpm 12 起的新策略:未获批准的依赖构建脚本会让安装直接失败。跳过脚本不影响绝大多数功能;确需构建原生依赖(node-pty / koffi 等)时,可给单个包加 <code>--allow-build=包名</code>,或把 pnpm 换回 11.x"#.to_string(),
+                r#"查看日志文件 <code>~/.dsh/.dsh-app-launcher.log</code> 的最后几十行"#.to_string(),
+                "修复后从菜单「配置 → 退出 DeepSeek Harness」彻底退出,再重新打开本应用".to_string(),
+            ],
         }
     }
 }
@@ -503,6 +521,12 @@ fn classify_boot_failure(log: &str, had_child: bool) -> BootFailure {
     // 建议纯属误导 —— 用户会去查网络和 Node 版本,而真正要做的是换频道。
     if log.contains("ERR_PNPM_NO_MATCHING_VERSION") {
         return BootFailure::ChannelUnavailable;
+    }
+    // pnpm ≥ 12 把「依赖的构建脚本未获批准」从警告升级为硬错误:dlx 在 dsh 起来
+    // 之前就 exit 1。正常路径会自动带跳过脚本的参数重试一次;分类到这里说明重试
+    // 没能救回来。这**不是**上游缺件,换频道只会白下载一整个版本。
+    if log.contains("ERR_PNPM_IGNORED_BUILDS") {
+        return BootFailure::BuildScriptsBlocked;
     }
     BootFailure::NotReady
 }
@@ -903,7 +927,12 @@ fn resolve_dsh_spec() -> String {
 
 /// 拉起 dsh web 后端:优先 `pnpm dlx`,没有 pnpm 时回退 `npx -y`。
 /// 全程无 stdin,所以任何交互确认都必须提前在环境变量里关掉。
-fn spawn_dsh(spec: &str) -> Option<Child> {
+///
+/// `skip_build_scripts`:pnpm ≥ 12 遇到「依赖的构建脚本未获批准」会以
+/// ERR_PNPM_IGNORED_BUILDS 硬退出,后端连启动的机会都没有。带上
+/// `--config.ignore-scripts=true` 后,dsh 得到的安装结果与 pnpm 10/11 时代
+/// (只警告、不执行构建脚本)完全一致。仅在检测到该错误的自动重试路径上启用。
+fn spawn_dsh(spec: &str, skip_build_scripts: bool) -> Option<Child> {
     let log = log_path();
     // 先滚动过大的日志,再打开后端句柄(顺序反了会把后端输出写进旧文件)。
     rotate_launcher_log_if_oversized(&log);
@@ -927,6 +956,21 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
         );
     }
 
+    // pnpm ≥ 12 把「依赖的构建脚本未获批准」从警告升级为硬错误
+    // (ERR_PNPM_IGNORED_BUILDS),dlx 会在 dsh 启动前就 exit 1 —— 表现为
+    // 「平时能用、pnpm 一升级就起不来」。这个参数让安装显式跳过构建脚本,
+    // 行为回到 pnpm 10/11 的既有语义,只在检测到该错误的自动重试里启用。
+    //
+    // 用 `--config.ignore-scripts=true` 而不是裸的 `--ignore-scripts`:裸写法
+    // pnpm 10/11 的 dlx 会直接报 Unknown option(把本来能用的环境搞坏);而会
+    // 报 ERR_PNPM_IGNORED_BUILDS 的 pnpm 必然 ≥ 12(10 也能识别 --config. 写法),
+    // 两头都不踩空。注意参数必须排在包名之前。
+    let pnpm_flag = if skip_build_scripts {
+        "--config.ignore-scripts=true "
+    } else {
+        ""
+    };
+
     // pnpm dlx 会直接安装临时包，不需要 npx 的 `-y` 确认选项。
     // --no-open:桌面壳自己导航到 WebView,不让 dsh 再弹系统默认浏览器。
     //
@@ -944,8 +988,9 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
         // 但 dsh 自己崩溃时也会触发,白白拉一次 220 MB 的 npx 重装。
         let mut c = Command::new("cmd");
         c.arg("/C").raw_arg(format!(
-            "\"where pnpm >nul 2>nul & if errorlevel 1 (npx -y {spec} web --no-open) else (pnpm dlx {spec} web --no-open)\"",
-            spec = spec
+            "\"where pnpm >nul 2>nul & if errorlevel 1 (npx -y {spec} web --no-open) else (pnpm dlx {pnpm_flag}{spec} web --no-open)\"",
+            spec = spec,
+            pnpm_flag = pnpm_flag
         ));
         c
     };
@@ -956,7 +1001,8 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
         // 也带不出 nvm/volta 这些)。桌面 shell 不能凭空假设 PATH,所以用 zsh 加载
         // 用户的完整环境来执行,并兜底补常见 pnpm 安装位置。
         //
-        // ⚠ 这段脚本文本经 `format!` 展开:**除了占位符,里面不许出现任何花括号**。
+        // ⚠ 这段脚本文本经 `format!` 展开:**除了 {spec} / {pnpm_flag} 这类注入
+        //   占位符,里面不许出现任何花括号**。
         //   写一个左花括号会直接编译不过;双写虽然能编译,但
         //   tests/test_launcher_command.py 是**直接抽取源码里的脚本文本**去真跑的
         //   (并不经过 format!),抽出来的双花括号会让 zsh 报 `bad substitution` ——
@@ -978,7 +1024,7 @@ fn spawn_dsh(spec: &str) -> Option<Child> {
 export DSH_NODE_DIRS
 if command -v pnpm >/dev/null 2>&1; then
   PATH="$PATH:$DSH_NODE_DIRS"
-  pnpm dlx {spec} web --no-open
+  pnpm dlx {pnpm_flag}{spec} web --no-open
   exit $?
 fi
 # pnpm 不在当前 PATH —— 把常用安装路径都探一版,再找不到才退 npx
@@ -986,7 +1032,7 @@ for d in "$HOME/.local/share/pnpm" "$HOME/.npm-global/bin" "$HOME/.tesh" "$HOME/
   if [ -n "$d" ] && [ -x "$d/pnpm" ]; then
     # $d 也追加进去:node 与 pnpm 同目录的布局(volta/nvm)才找得到 node
     PATH="$PATH:$d:$DSH_NODE_DIRS"
-    exec "$d/pnpm" dlx {spec} web --no-open
+    exec "$d/pnpm" dlx {pnpm_flag}{spec} web --no-open
   fi
 done
 # 没有 pnpm 就用 Node 自带的 npx。`-y` 必须带:否则它会问 "Ok to proceed? (y)",
@@ -997,7 +1043,8 @@ if command -v npx >/dev/null 2>&1; then
 fi
 echo "ERROR: neither pnpm nor npx found. Install Node.js (https://nodejs.org) or pnpm (https://pnpm.io/installation)" >&2
 exit 127"#,
-            spec = spec
+            spec = spec,
+            pnpm_flag = pnpm_flag
         );
         // 用 zsh 执行以加载用户完整环境;缺 zsh 时退回 sh
         const ZSH: &str = "/bin/zsh";
@@ -1026,13 +1073,13 @@ exit 127"#,
 export DSH_NODE_DIRS
 if command -v pnpm >/dev/null 2>&1; then
   PATH="$PATH:$DSH_NODE_DIRS"
-  pnpm dlx {spec} web --no-open
+  pnpm dlx {pnpm_flag}{spec} web --no-open
   exit $?
 fi
 for d in "$HOME/.local/share/pnpm" "$HOME/.npm-global/bin" "$HOME/.volta/bin" "$HOME/.nvm/current/bin" "$HOME/.asdf/shims" "$(npm prefix -g 2>/dev/null)/bin"; do
   if [ -n "$d" ] && [ -x "$d/pnpm" ]; then
     PATH="$PATH:$d:$DSH_NODE_DIRS"
-    exec "$d/pnpm" dlx {spec} web --no-open
+    exec "$d/pnpm" dlx {pnpm_flag}{spec} web --no-open
   fi
 done
 # 没有 pnpm 就用 Node 自带的 npx。`-y` 必须带:否则它会问 "Ok to proceed? (y)",
@@ -1042,7 +1089,8 @@ if command -v npx >/dev/null 2>&1; then
 fi
 echo "ERROR: neither pnpm nor npx found. Install Node.js (https://nodejs.org) or pnpm (https://pnpm.io/installation)" >&2
 exit 127"#,
-            spec = spec
+            spec = spec,
+            pnpm_flag = pnpm_flag
         );
         let mut c = Command::new("sh");
         c.args(["-c", script.as_str()]);
@@ -1083,9 +1131,14 @@ exit 127"#,
     match cmd.spawn() {
         Ok(child) => {
             append_launcher_log(&format!(
-                "[{}] dsh 启动中: {} web --no-open (pnpm dlx,缺 pnpm 时回退 npx -y), PID={}\n",
+                "[{}] dsh 启动中: {} web --no-open (pnpm dlx{},缺 pnpm 时回退 npx -y), PID={}\n",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
                 spec,
+                if skip_build_scripts {
+                    ",已跳过构建脚本"
+                } else {
+                    ""
+                },
                 child.id()
             ));
             Some(child)
@@ -2926,6 +2979,9 @@ fn main() {
 
             // 备选频道链在 if 之外声明:启动 worker 是另一个闭包,要把它 move 进去。
             let mut fallback_specs: Vec<String> = Vec::new();
+            // 本次尝试当前用的 spec。重试路径要用**当前**值 —— 频道回退过后它已经
+            // 不是最初那个了,拿旧 spec 重试等于把刚换掉的频道又装一遍。
+            let mut current_spec = String::new();
             let child = if probe_dsh() == DshState::Down {
                 // 只有真要拉起后端时才去解析版本,复用已在跑的实例不付这次网络开销。
                 // 版本解析是一次 registry 网络请求(最多 5s),spawn 前先告诉加载页,
@@ -2936,7 +2992,8 @@ fn main() {
                 // 备选链在这里先算好:启动 worker 一旦发现这个 tag 在上游装不上
                 // (见 BootFailure::ChannelUnavailable),就顺着它逐个换频道重试。
                 fallback_specs = fallback_dsh_specs(&spec);
-                spawn_dsh(&spec)
+                current_spec = spec.clone();
+                spawn_dsh(&spec, false)
             } else {
                 None
             };
@@ -2984,6 +3041,10 @@ fn main() {
                 // 实际回退到过的频道(按顺序)。静默换版本会让用户以为自己跑的还是
                 // 原来那个,所以这句话在整个等待期间都挂在状态行上。
                 let mut fallback_hops: Vec<String> = Vec::new();
+                // pnpm ≥ 12 拦下依赖构建脚本(ERR_PNPM_IGNORED_BUILDS)时,自动改成
+                // 「跳过构建脚本」的方式重试。只做一次:标志位翻起后,后续所有拉起
+                // (含频道回退)都沿用同一种安装方式,不再来回切换到会失败的那种。
+                let mut skip_build_scripts = false;
 
                 loop {
                     let now = Instant::now();
@@ -3064,7 +3125,7 @@ fn main() {
                                     &format!("上一个频道在上游装不上,正在改用 {alternative}"),
                                     None,
                                 );
-                                let mut spawned = spawn_dsh(&alternative);
+                                let mut spawned = spawn_dsh(&alternative, skip_build_scripts);
                                 match window.app_handle().try_state::<DshChild>() {
                                     Some(state) if spawned.is_some() => {
                                         let mut guard = match state.0.lock() {
@@ -3074,6 +3135,7 @@ fn main() {
                                         // 旧进程已经退出了,直接顶掉,后面的 try_wait 才会盯新的
                                         *guard = spawned.take();
                                         fallback_hops.push(channel_tag(&alternative));
+                                        current_spec = alternative;
                                         // 换 tag 等于一份全新的下载,重新给足时间预算
                                         deadline = Instant::now()
                                             + Duration::from_secs(BOOT_TIMEOUT_SECS);
@@ -3086,6 +3148,48 @@ fn main() {
                                         if let Some(mut orphan) = spawned {
                                             terminate_child_tree(&mut orphan);
                                         }
+                                    }
+                                }
+                            }
+                        }
+
+                        // pnpm ≥ 12 把「依赖的构建脚本未获批准」当硬错误,dlx 在 dsh
+                        // 起来之前就退出。这不是上游的问题,也不需要换频道:显式跳过
+                        // 构建脚本重试一次即可(与 pnpm 10/11 的既有行为一致)。
+                        // 只重试一次 —— 再失败就如实报错,不在同一个错误上打转。
+                        if kind == BootFailure::BuildScriptsBlocked && !skip_build_scripts {
+                            append_launcher_log(&format!(
+                                "[{}] pnpm 拦下了依赖构建脚本(ERR_PNPM_IGNORED_BUILDS),自动跳过构建脚本重试\n",
+                                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                            ));
+                            push_boot_progress(
+                                &window,
+                                BootStage::Spawn,
+                                0,
+                                "pnpm 拦下了依赖构建脚本,正在跳过构建脚本重试…",
+                                None,
+                            );
+                            let mut spawned = spawn_dsh(&current_spec, true);
+                            match window.app_handle().try_state::<DshChild>() {
+                                Some(state) if spawned.is_some() => {
+                                    let mut guard = match state.0.lock() {
+                                        Ok(guard) => guard,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    // 旧进程已经退出了,直接顶掉,后面的 try_wait 才会盯新的
+                                    *guard = spawned.take();
+                                    skip_build_scripts = true;
+                                    // 换安装方式等于重跑一遍安装,重新给足时间预算
+                                    deadline = Instant::now()
+                                        + Duration::from_secs(BOOT_TIMEOUT_SECS);
+                                    child_exited = None;
+                                    stage = BootStage::Spawn;
+                                    continue;
+                                }
+                                // 拿不到共享状态就别把新进程留在那儿占 3080
+                                _ => {
+                                    if let Some(mut orphan) = spawned {
+                                        terminate_child_tree(&mut orphan);
                                     }
                                 }
                             }
@@ -4032,6 +4136,40 @@ mod tests {
         );
     }
 
+    /// pnpm ≥ 12 把「依赖的构建脚本未获批准」当硬错误 —— dlx 秒退,dsh 根本没启动。
+    ///
+    /// 2026-10-16 实测:pnpm 升到 12.4.1 后,同样的 dsh 版本、同样的命令,应用直接
+    /// 「后端进程启动失败(退出码 1)」。日志里只有 ERR_PNPM_IGNORED_BUILDS。
+    /// 这必须单独归类(错误页要交代壳已自动跳过脚本重试过),而且**不能**触发
+    /// 频道回退:换 tag 是白下载一整个版本,pnpm 的策略拦截还在。
+    #[test]
+    fn blocked_dependency_build_scripts_are_diagnosed_and_never_trigger_a_channel_switch() {
+        let log = "\
+===== 启动于 2026-10-16 10:43:14 =====\n\
++ @deepseek-ai/dsh 0.1.6-alpha.2\n\
+\n\
+Error: ERR_PNPM_IGNORED_BUILDS\n\
+\n\
+  × adding a new package\n\
+  ╰─▶ Ignored build scripts: @deepseek-ai/dsh-subprocess-local@0.1.6-alpha.2, \
+node-pty@1.2.0-beta.15\n\
+      help: Run \"pnpm approve-builds\" to pick which dependencies should be allowed\n";
+        assert_eq!(
+            classify_boot_failure(current_attempt_log(log), true),
+            BootFailure::BuildScriptsBlocked
+        );
+        assert_ne!(
+            BootFailure::BuildScriptsBlocked,
+            BootFailure::ChannelUnavailable,
+            "pnpm 的策略拦截不是上游缺件,换频道治不了"
+        );
+        let steps = BootFailure::BuildScriptsBlocked.steps().join("\n");
+        assert!(
+            steps.contains("--config.ignore-scripts=true"),
+            "手动复核命令必须带上壳实际用的参数: {steps}"
+        );
+    }
+
     /// 装上了、但插件树炸了:必须单独归类,**且不得触发频道回退**。
     ///
     /// 2026-09-22 实测:回退到 `alpha` 并不会让插件复活,而是一次炸四个
@@ -4232,6 +4370,9 @@ Error: permission: \"auto\" is reserved and cannot name a configured preset\n";
             BootFailure::RunnerExited,
             BootFailure::AuthRejected,
             BootFailure::NotReady,
+            BootFailure::ChannelUnavailable,
+            BootFailure::PluginTreeFailed,
+            BootFailure::BuildScriptsBlocked,
         ] {
             let steps = kind.steps();
             assert!(!steps.is_empty(), "{kind:?} 缺少排查建议");
@@ -4549,6 +4690,76 @@ app-dsh-channel: \"latest\"
         assert!(
             !open_block.contains(".truncate(true)"),
             "启动日志不能用 truncate,否则覆盖上一次启动的日志"
+        );
+    }
+
+    /// 修复 pnpm ≥ 12 的 ERR_PNPM_IGNORED_BUILDS:所有 pnpm 拉起点都要能带上
+    /// 「跳过构建脚本」参数,而且参数必须排在包名之前 —— 放到 `web --no-open`
+    /// 之后会被当成 dsh 自己的参数,安装照样失败。
+    #[test]
+    fn every_pnpm_dlx_invocation_can_skip_build_scripts_before_the_spec() {
+        let source = include_str!("main.rs");
+        let spawn = &source[source.find("fn spawn_dsh(").expect("spawn_dsh must exist")..];
+        let end = spawn
+            .find("fn plugin_update_log_path(")
+            .expect("spawn_dsh must end before plugin_update_log_path");
+        let body = &spawn[..end];
+        assert!(
+            body.contains("let pnpm_flag = if skip_build_scripts"),
+            "跳过脚本的参数要挂在显式开关上,默认路径必须与现状一致"
+        );
+        assert!(
+            body.contains("--config.ignore-scripts=true"),
+            "要用 pnpm 10+ 都认识的 --config. 通用写法;裸 --ignore-scripts 会让 10/11 的 dlx 报 Unknown option"
+        );
+        assert_eq!(
+            body.matches(concat!("dlx ", "{pnpm_flag}", "{spec}", " web --no-open"))
+                .count(),
+            5,
+            "Windows 1 处 + macOS 2 处 + Linux 2 处,一个都不能漏"
+        );
+        assert_eq!(
+            body.matches(concat!("npx -y ", "{spec}", " web --no-open"))
+                .count(),
+            3,
+            "npx 分支不该被塞 pnpm 参数"
+        );
+    }
+
+    /// IGNORED_BUILDS 的自动重试:只做一次、写回共享状态、并用**当前** spec。
+    ///
+    /// 不设「只一次」的闸门,错误持续时会在重启里打转;不写回共享状态,
+    /// try_wait 还盯着已经退出的旧进程,重试就白做。频道回退过后 current_spec
+    /// 必须跟着换,否则会把刚换掉的频道又装一遍。
+    #[test]
+    fn blocked_build_scripts_trigger_exactly_one_skip_build_scripts_retry() {
+        let source = include_str!("main.rs");
+        let worker = &source[source
+            .find("spawn_boot_worker(move || {")
+            .expect("boot worker must exist")..];
+        let worker = &worker[..worker
+            .find(".on_menu_event")
+            .expect("boot worker must end before on_menu_event")];
+        assert_eq!(
+            worker.matches("spawn_dsh(&current_spec, true)").count(),
+            1,
+            "跳过脚本的重试落点必须唯一"
+        );
+        assert!(
+            worker.contains("!skip_build_scripts"),
+            "只重试一次:再失败就如实报错,不在同一个错误上打转"
+        );
+        assert!(
+            worker.contains("BootFailure::BuildScriptsBlocked") && worker.contains("ERR_PNPM_IGNORED_BUILDS"),
+            "重试要由这个具体错误触发,而不是随便什么退出"
+        );
+        assert!(
+            worker.matches("*guard = spawned.take();").count() >= 2,
+            "两条重试路径都要把新进程顶进共享状态,否则轮询还盯着旧进程"
+        );
+        assert!(
+            worker.contains("current_spec = alternative"),
+            "频道回退后要用新 spec,而不是重装旧频道"
         );
     }
 

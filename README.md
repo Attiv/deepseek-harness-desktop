@@ -161,6 +161,7 @@ gh variable set TAURI_UPDATER_PUBLIC_KEY < ~/.tauri/dsh-app.key.pub
 |---|---|---|
 | 找不到包管理器 | 后端脚本打印 `neither pnpm nor npx found` | 装 Node.js ≥ 22.19 或 pnpm |
 | 后端进程启动失败 | 拉起的进程在监听端口前就退出 | 在终端手动跑一次 `pnpm dlx` 看报错 |
+| pnpm 拦下了依赖构建脚本 | 日志出现 `ERR_PNPM_IGNORED_BUILDS`(pnpm ≥ 12 对未批准构建脚本的硬错误) | 壳已自动跳过脚本重试过;仍失败时按下方「pnpm 12 拦下依赖构建脚本」手动复核 |
 | DSH 认证失败 | 端口有响应但始终换不到 cookie | 关掉终端里占用 3080 的那个实例 |
 | DSH 启动超时 | 等满 10 分钟仍未就绪 | 检查网络/镜像源,或钉死 `app-dsh-channel` |
 | 上游这个版本装不上 | 日志出现 `ERR_PNPM_NO_MATCHING_VERSION` | 壳已自动换过全部频道;见下方「上游发布缺件」 |
@@ -239,6 +240,34 @@ ERR_PNPM_NO_MATCHING_VERSION  No matching version found for
 
 想省掉每次启动都试一遍前面几个坏频道,可以把 `app-dsh-channel` 直接钉到当前能用的
 那个(如 `alpha`),等上游修好再切回来。
+
+### pnpm 12 拦下依赖构建脚本
+
+pnpm 12 起,「依赖里有未批准运行的构建脚本」从警告升级为**硬错误**:安装阶段直接退出,
+dsh 连启动的机会都没有。
+
+```
+Error: ERR_PNPM_IGNORED_BUILDS
+
+  × adding a new package
+  ╰─▶ Ignored build scripts: @deepseek-ai/dsh-subprocess-local@0.1.6-alpha.2,
+      node-pty@1.2.0-beta.15
+```
+
+dsh 的传递依赖里有一批带安装脚本的包(node-pty / koffi 等原生模块)。pnpm 10/11
+遇到它们只是警告并跳过构建脚本,后端照常启动;pnpm 12 会让整个安装失败 —— 表现是
+「pnpm 一升级,应用突然打不开」。
+
+壳检测到 `ERR_PNPM_IGNORED_BUILDS` 后会**自动改用 `--config.ignore-scripts=true`
+重试一次**(安装结果与 pnpm 10/11 的既有行为一致:原生加速模块不编译,不影响绝大多数
+功能),并把这次重试写进启动日志。想手动复核,直接执行:
+
+```bash
+pnpm dlx --config.ignore-scripts=true @deepseek-ai/dsh@latest web --no-open
+```
+
+确需构建原生依赖时,可对单个包放行:`pnpm dlx --allow-build=node-pty …`;
+或把 pnpm 换回 11.x 等待上游适配。
 
 ### 为什么传 tag 而不是精确版本号
 
