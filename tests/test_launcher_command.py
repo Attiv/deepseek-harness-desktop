@@ -400,6 +400,42 @@ class LauncherCommandTests(unittest.TestCase):
             r'"update-plugins"\s*=>\s*update_web_profile_plugins\s*\(\s*app\s*\)',
         )
 
+    def test_menu_offers_one_click_session_history_purge(self):
+        """清会话历史原先只能在完全退出后手删 ~/.dsh/sessions —— 菜单里要有入口。"""
+        self.assertIn('with_id("clear-sessions", "清除全部会话历史…")', self.source)
+        self.assertRegex(
+            self.source,
+            r'"clear-sessions"\s*=>\s*do_clear_sessions\s*\(\s*app\s*\)',
+        )
+        self.assertRegex(self.source, r"\.item\(&clear_sessions_item\)")
+
+    def test_session_history_purge_stops_the_backend_before_deleting(self):
+        """后端还在跑时删会话是假删除(继续落盘 / 按内存态重建);3080 上还活着的
+        外部实例更会把同一份历史写回来。顺序必须是:
+        停自己的后端 → 确认端口没人听 → 才动文件;有人听就中止,一个文件不删。"""
+        body = self._function_body("fn clear_session_history(")
+        stop = body.index("stop_owned_dsh(app)")
+        probe = body.index("probe_dsh()")
+        delete = body.index("clear_session_history_files(")
+        self.assertLess(stop, probe, "先停后端,再探测端口")
+        self.assertLess(probe, delete, "确认 3080 没人听之后才删文件")
+        self.assertIn("DshState::Down", body)
+        self.assertIn("ClearSessionsOutcome::Aborted", body, "外部实例在跑必须走中止路径")
+        self.assertNotIn("app.restart()", body, "重启与否由调用方按结果决定,执行函数自己不重启")
+
+    def test_session_purge_confirms_first_and_never_silently_restarts_on_failure(self):
+        body = self._function_body("fn do_clear_sessions(")
+        self.assertIn("OkCancelCustom", body, "破坏性操作必须给确认与取消两个选项")
+        self.assertIn("show_status(", body)
+        self.assertIn("spawn_blocking(", body, "磁盘 IO 与端口探测不能占 UI 线程")
+        self.assertNotIn("alert(", body)
+        self.assertIn("ClearSessionsOutcome::Failed", body, "失败要如实报错")
+        self.assertRegex(
+            body,
+            r"ClearSessionsOutcome::Failed\([\s\S]*?show_config_result\(",
+            "失败路径走原生回执,先让人读完再手动重启",
+        )
+
     def test_plugin_update_is_non_interactive_and_updates_the_profile(self):
         self.assertIn("pnpm update", self.source)
         self.assertIn("npx -y pnpm update", self.source)

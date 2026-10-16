@@ -79,13 +79,21 @@ fn take_owned_child(state: &DshChild) -> Option<Child> {
     owned_child.take()
 }
 
-fn stop_owned_dsh(app: &tauri::AppHandle) {
+/// 终止本应用拉起的后端进程树(还拿着的话),并返回是否真的收掉了一个。
+///
+/// 返回值供「清除会话历史」区分「本应用启动的后端」与「复用的外部实例」——
+/// 后者不能终止;收掉前者的场合,调用方需要重启应用把后端拉回来。
+fn stop_owned_dsh(app: &tauri::AppHandle) -> bool {
     let Some(state) = app.try_state::<DshChild>() else {
-        return;
+        return false;
     };
 
-    if let Some(mut child) = take_owned_child(&state) {
-        terminate_child_tree(&mut child);
+    match take_owned_child(&state) {
+        Some(mut child) => {
+            terminate_child_tree(&mut child);
+            true
+        }
+        None => false,
     }
 }
 
@@ -570,6 +578,18 @@ const EXPORT_ITEMS: &[&str] = &[
     ".anonymous-user-id",
     "skills",
     "storages",
+];
+
+/// 「清除全部会话历史」的删除目标(相对于 ~/.dsh)。
+///
+/// 只删会话记录本身与由它派生的投影缓存:工作区列表、归档标记、设置、插件、
+/// 上传的附件都不属于「对话记录」,不在删除范围。投影缓存里存着标题、统计与
+/// 会话摘要 —— 留着会把已删会话的内容残在磁盘上,所以必须一起清;后端下次
+/// 用到时会自行重建。
+const SESSION_HISTORY_ITEMS: &[&str] = &[
+    "sessions",
+    "storages/session_projcache",
+    "storages/session_projcache.json",
 ];
 
 /// 需要导出的 profile 配置(不含 node_modules)
@@ -2181,6 +2201,10 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .build(app).map_err(|e| e.to_string())?;
     let update_plugins_item = MenuItemBuilder::with_id("update-plugins", "一键更新全部插件")
         .build(app).map_err(|e| e.to_string())?;
+    // 会话历史原先只能完全退出后手删 ~/.dsh/sessions。单独一组,离导入/更新远一点,
+    // 破坏性操作别挨着高频操作放。
+    let clear_sessions_item = MenuItemBuilder::with_id("clear-sessions", "清除全部会话历史…")
+        .build(app).map_err(|e| e.to_string())?;
     let check_update_item = MenuItemBuilder::with_id("check-update", "检查更新…")
         .build(app).map_err(|e| e.to_string())?;
     // 勾选状态从设置里读,不用额外维护内存态
@@ -2228,6 +2252,8 @@ fn rebuild_menu(app: &tauri::AppHandle) -> Result<(), String> {
         .separator()
         .item(&import_item)
         .item(&update_plugins_item)
+        .separator()
+        .item(&clear_sessions_item)
         .separator()
         .item(&check_update_item)
         .item(&auto_check_update_item)
@@ -2555,6 +2581,145 @@ fn extract_import_zip(dsh: &Path, open_path: &Path) -> Result<String, String> {
         "已导入 {} 个配置文件。{}\n配置目录: {}\n跳过无效条目: {}\n\n请从菜单「配置 → 退出 DeepSeek Harness」彻底退出，再重新启动。\n仅关闭窗口或重新打开插件页面不会重启后端。\n若复用了终端启动的 DSH，也需重启该终端实例。\n\n这里只恢复配置，不包含插件安装包。若新电脑缺少插件，请先执行 dsh plugin --profile <配置名> install（网页配置名通常为 web）。",
         extracted, backup_note, canonical_dsh.display(), skipped
     ))
+}
+
+/// 「清除全部会话历史」的执行结果。
+///
+/// 重启与否由结果种类决定:只要后端被本应用收掉过,就必须重启 ——
+/// Cleared / Failed 都是这条;Aborted 在**没停过东西**时(复用的外部实例在跑)
+/// 界面还能继续用,不要重启。
+enum ClearSessionsOutcome {
+    /// 会话数据已删除 —— 调用方负责重启应用,把停止的后端拉回来。
+    Cleared(String),
+    /// 删除失败(哪个路径、什么错误已写进消息)—— 后端已收掉,同样要重启,
+    /// 但如实报错而不是报成功。
+    Failed(String),
+    /// 检测到外部实例在跑,一个文件都没删 —— 不要重启(消息里会说明:
+    /// 若本应用的后端刚被收掉,需手动重启)。
+    Aborted(String),
+}
+
+/// 执行「清除全部会话历史」:停后端 → 确认端口没人听 → 删数据。
+///
+/// 顺序不能换。后端还在跑时删文件是假删除:它手里的会话会继续落盘,删掉的
+/// 文件也会被内存态重建;而 3080 上还活着的外部实例(壳只复用、无权终止)更
+/// 不能带着删 —— 它只会把同一份历史原样写回来。所以先收掉自己拉起的那个,
+/// 再探一次端口:还有响应就中止,把「先停掉谁」告诉用户。
+fn clear_session_history(app: &tauri::AppHandle) -> ClearSessionsOutcome {
+    let stopped_owned = stop_owned_dsh(app);
+
+    if probe_dsh() != DshState::Down {
+        // 没停过东西还响应 → 复用的外部实例在跑;停过还响应 → 那个后端已被收掉,
+        // 端口在探测间隙被别的进程接走了(极小概率)。两种都不删文件,但第二种
+        // 要把「本应用的后端现在没人管」一并说清。
+        let mut message =
+            "3080 上仍有 DSH 在运行,而它不是本应用启动的 —— 壳只复用外部实例,不会去终止它。\n\
+             为避免它把会话原样写回磁盘,本次没有删除任何文件。\n\n\
+             请先停掉那个实例再重试,例如:\n\
+             • 在启动它的终端里按 Ctrl+C;\n\
+             • 或结束相关进程:macOS/Linux 执行 pkill -f \"@deepseek-ai/dsh\",Windows 在任务管理器里结束对应的 node 进程。"
+                .to_string();
+        if stopped_owned {
+            message.push_str(
+                "\n\n注意:本应用自己拉起的后端刚刚已被停止,处理完后请用菜单「配置 → 重启应用」恢复它。",
+            );
+        }
+        return ClearSessionsOutcome::Aborted(message);
+    }
+
+    match clear_session_history_files(&dsh_home()) {
+        Ok(message) => ClearSessionsOutcome::Cleared(message),
+        Err(error) => ClearSessionsOutcome::Failed(error),
+    }
+}
+
+/// 删除会话记录与派生缓存。同步执行,调用方负责放进 spawn_blocking。
+///
+/// 目标不存在按成功处理:清两遍、或本来就没聊过,都不该报错。目标若是符号
+/// 链接,只删链接本身、不跟进目标 —— 用户把 sessions 指到别处时,外部数据
+/// 归用户自己处置,壳不越界代删。
+fn clear_session_history_files(dsh: &Path) -> Result<String, String> {
+    let mut removed = 0usize;
+    let mut already_gone = 0usize;
+    for item in SESSION_HISTORY_ITEMS {
+        let target = dsh.join(item);
+        let metadata = match fs::symlink_metadata(&target) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                already_gone += 1;
+                continue;
+            }
+            Err(error) => return Err(format!("读取 {} 失败: {error}", target.display())),
+        };
+        let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(&target)
+        } else {
+            fs::remove_file(&target)
+        };
+        result.map_err(|error| format!("删除 {} 失败: {error}", target.display()))?;
+        removed += 1;
+    }
+
+    Ok(if removed == 0 {
+        "没有需要删除的会话数据。".to_string()
+    } else {
+        format!("已删除 {removed} 项会话数据({already_gone} 项本就不存在)。")
+    })
+}
+
+/// 清除全部会话历史(菜单「配置 → 清除全部会话历史…」)。
+///
+/// 破坏性操作先弹原生确认框;确认后在后台线程执行(磁盘 IO 与端口探测都是
+/// 阻塞调用),不占 UI 线程。成功会重启应用;失败与中止的区别见
+/// ClearSessionsOutcome 的注释。
+fn do_clear_sessions(app: &tauri::AppHandle) {
+    let window = match app.get_webview_window("main") {
+        Some(w) => w,
+        None => return,
+    };
+    let app = app.clone();
+
+    window
+        .dialog()
+        .message(
+            "将永久删除全部对话记录,不可恢复:\n\n\
+             • ~/.dsh/sessions —— 全部会话历史\n\
+             • ~/.dsh/storages/session_projcache* —— 会话投影缓存\n\n\
+             保留:工作区列表、设置、插件、上传的附件。\n\
+             执行前会先停掉本应用拉起的 DSH 后端,完成后应用自动重启;\n\
+             若后端是你在终端启动的(壳只是复用),会中止并提示,不会误删。",
+        )
+        .title("清除全部会话历史")
+        .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "清除全部历史".to_string(),
+            "取消".to_string(),
+        ))
+        .show(move |confirmed| {
+            if !confirmed {
+                return;
+            }
+            show_status(&app, "正在清除全部会话历史…", "running");
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || match clear_session_history(&app) {
+                ClearSessionsOutcome::Cleared(message) => {
+                    append_launcher_log(&format!("用户清除了全部会话历史:{message}\n"));
+                    show_status(&app, &format!("已清除全部会话历史:{message}"), "success");
+                    app.restart();
+                }
+                ClearSessionsOutcome::Failed(error) => {
+                    // 不自动重启:错误回执要先让人读完。菜单里就能手动重启。
+                    show_config_result(
+                        &app,
+                        "清除全部会话历史",
+                        Err(format!("{error}\n\n后端已停止,请从菜单「配置 → 重启应用」把它拉回来。")),
+                    );
+                }
+                ClearSessionsOutcome::Aborted(message) => {
+                    show_config_result(&app, "清除全部会话历史", Err(message));
+                }
+            });
+        });
 }
 
 /// 认证失败页的排查步骤。launch token 每进程随机、只在 dsh 自己的 stdout 打印,
@@ -3501,6 +3666,7 @@ fn main() {
                 "export-no-cred" => do_export(app, false),
                 "export-cred" => do_export(app, true),
                 "import" => do_import(app),
+                "clear-sessions" => do_clear_sessions(app),
                 "reload" => reload_main_window(app),
                 "update-plugins" => update_web_profile_plugins(app),
                 "check-update" => check_for_updates(app, true),
@@ -3968,6 +4134,65 @@ mod tests {
         let archive = fixture.archive(&[("profiles/settings.yaml", "new")]);
         assert!(extract_import_zip(&target, &archive).is_err());
         assert!(!outside.join("settings.yaml").exists());
+    }
+
+    #[test]
+    fn clearing_session_history_removes_logs_and_caches_but_keeps_settings() {
+        let fixture = ConfigFixture::new();
+        let dsh = fixture.0.join("dsh");
+        fs::create_dir_all(dsh.join("sessions/--Users-x-proj--/session-abc")).unwrap();
+        fs::write(
+            dsh.join("sessions/--Users-x-proj--/session-abc/session.v3.jsonl.zstd"),
+            "log",
+        ).unwrap();
+        fs::create_dir_all(dsh.join("storages/session_projcache")).unwrap();
+        fs::write(dsh.join("storages/session_projcache/session-abc.json"), "{}").unwrap();
+        fs::write(dsh.join("storages/session_projcache.json"), "{}").unwrap();
+        fs::write(dsh.join("storages/workspace.json"), "{}").unwrap();
+        fs::write(dsh.join("settings.yaml"), "theme: dark").unwrap();
+        fs::create_dir_all(dsh.join("attachments/v1")).unwrap();
+        fs::write(dsh.join("attachments/v1/blob"), "file").unwrap();
+
+        let message = clear_session_history_files(&dsh).unwrap();
+
+        assert!(message.contains("已删除 3 项会话数据"), "{message}");
+        assert!(!dsh.join("sessions").exists(), "会话记录必须删掉");
+        assert!(!dsh.join("storages/session_projcache").exists(), "投影缓存必须删掉");
+        assert!(!dsh.join("storages/session_projcache.json").exists(), "投影缓存索引必须删掉");
+        assert!(dsh.join("storages/workspace.json").exists(), "工作区列表不在删除范围");
+        assert!(dsh.join("settings.yaml").exists(), "设置不在删除范围");
+        assert!(dsh.join("attachments/v1/blob").exists(), "附件不在删除范围");
+    }
+
+    #[test]
+    fn clearing_session_history_twice_is_not_an_error() {
+        let fixture = ConfigFixture::new();
+        let dsh = fixture.0.join("dsh");
+        fs::create_dir_all(dsh.join("sessions")).unwrap();
+
+        assert!(clear_session_history_files(&dsh).unwrap().contains("已删除 1 项会话数据"));
+        let second = clear_session_history_files(&dsh).unwrap();
+        assert!(second.contains("没有需要删除的会话数据"), "{second}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clearing_session_history_never_follows_a_symlinked_sessions_dir() {
+        let fixture = ConfigFixture::new();
+        let dsh = fixture.0.join("dsh");
+        let real = fixture.0.join("elsewhere");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("session.v3.jsonl.zstd"), "log").unwrap();
+        fs::create_dir_all(&dsh).unwrap();
+        std::os::unix::fs::symlink(&real, dsh.join("sessions")).unwrap();
+
+        clear_session_history_files(&dsh).unwrap();
+
+        assert!(!dsh.join("sessions").exists(), "链接本身要删掉");
+        assert!(
+            real.join("session.v3.jsonl.zstd").exists(),
+            "链接目标不是壳的数据,不能跟着删"
+        );
     }
 
     #[test]
