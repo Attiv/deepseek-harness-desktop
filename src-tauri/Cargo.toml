@@ -1,6 +1,6 @@
 [package]
 name = "dsh-app"
-version = "1.4.22"
+version = "1.4.23"
 edition = "2021"
 
 [build-dependencies]

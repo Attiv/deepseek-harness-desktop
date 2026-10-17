@@ -5,7 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -290,7 +290,7 @@ fn tail_launcher_log(max_lines: usize) -> String {
     const MAX_TAIL_BYTES: u64 = 32 * 1024;
     const MAX_LINE_CHARS: usize = 240;
 
-    let Ok(file) = File::open(log_path()) else {
+    let Ok(mut file) = File::open(log_path()) else {
         return String::new();
     };
     let Ok(len) = file.metadata().map(|meta| meta.len()) else {
@@ -298,12 +298,12 @@ fn tail_launcher_log(max_lines: usize) -> String {
     };
     let start = len.saturating_sub(MAX_TAIL_BYTES);
     let mut text = String::new();
-    if file
-        .take(len - start)
-        .read_to_string(&mut text)
-        .is_err()
-        && text.is_empty()
-    {
+    // 读取游标默认在 0:必须先 seek 到 start,否则 take(len - start) 读到的是
+    // 文件**开头**的 32 KiB,而不是末尾。日志一旦超过 32 KiB,不 seek 就会
+    // 永远对着陈年旧账做失败分类、也不会有正确的错误页现场。
+    let tail_ok = file.seek(SeekFrom::Start(start)).is_ok()
+        && file.take(len - start).read_to_string(&mut text).is_ok();
+    if !tail_ok && text.is_empty() {
         // 非 UTF-8 是可能的(Windows 上旧版 pnpm 会输出本地编码),
         // 用 lossy 再兜一次,保证至少能看到半行线索。
         let mut raw = Vec::new();

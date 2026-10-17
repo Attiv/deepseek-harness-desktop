@@ -507,6 +507,19 @@ class LauncherCommandTests(unittest.TestCase):
         self.assertIn("tail_launcher_log", window, "错误页要带日志现场")
         self.assertIn("timeout_secs", window, "错误信息要带实际等待时长")
 
+    def test_log_tail_seeks_to_the_end_before_reading(self):
+        """日志超过 32 KiB 后读到的是尾巴还是开头,决定了失败分类与错误页是否有效。
+
+        File 的读取游标默认在 0,漏掉 seek 会一直取文件**开头**的陈年日志:
+        ERR_PNPM_IGNORED_BUILDS / 频道缺包等分类全部失配(2026-10-17 实测踩中)。
+        """
+        body = self._function_body("fn tail_launcher_log(")
+        seek = body.find(".seek(SeekFrom::Start(start))")
+        take = body.find(".take(len - start)")
+        self.assertNotEqual(seek, -1, "读取尾部前必须显式 seek 到 start")
+        self.assertNotEqual(take, -1, "仍然只读尾部字节,不整文件读")
+        self.assertLess(seek, take, "先 seek 再 take,否则读到的还是文件头")
+
     def test_synchronous_startup_loop_uses_blocking_worker(self):
         """reqwest blocking + sleep 不能放在永不 await 的 async task 中。"""
         window = self.source[

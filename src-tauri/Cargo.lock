@@ -857,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-app"
-version = "1.4.22"
+version = "1.4.23"
 dependencies = [
  "chrono",
  "cookie",
